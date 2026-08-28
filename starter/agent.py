@@ -59,6 +59,23 @@ def _extract_constraints(message: str) -> list[str]:
     return []
 
 
+def _is_override(message: str) -> bool:
+    text = message.lower()
+
+    override_markers = [
+        "actually",
+        "instead",
+        "changed my mind",
+        "change of plan",
+        "forget that",
+        "forget about",
+        "ignore my earlier",
+        "no longer",
+    ]
+
+    return any(marker in text for marker in override_markers)
+
+
 class Agent:
     """Editable weak baseline: stateless BM25 retrieval with no LLM dependency."""
 
@@ -115,10 +132,19 @@ class Agent:
         # add memory to the session state to save user's message
         state = self._sessions[session_id]
 
+
         retry_message = (
             "those options are not quite right yet"
             in user_message.lower()
         )
+
+        # User has changed their intent.
+        # # Remove information belonging to the old request.
+        # if _is_override(user_message):
+        #     state["history"] = []
+        #     state["constraints"] = []
+
+        state["history"].append(user_message)
 
         # Only store actual shopping information
         if not retry_message:
@@ -132,6 +158,10 @@ class Agent:
 
         profile = state["user_profile"]
         preferences = profile.get("preference_tags", [])
+
+        for constraint in new_constraints:
+            if constraint not in state["constraints"]:
+                state["constraints"].append(constraint)
 
         query = " ".join(state["history"])
 
