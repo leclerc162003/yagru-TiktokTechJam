@@ -31,6 +31,33 @@ def _terms(text: str) -> list[str]:
         if len(token) > 1 and token.lower() not in STOPWORDS
     ]
 
+def _normalize(text: str) -> str:
+    return " ".join(TOKEN_RE.findall(text.lower()))
+
+
+def _extract_constraints(message: str) -> list[str]:
+    patterns = [
+        "a key requirement is:",
+        "for that, what matters is:",
+        "what i need is:",
+    ]
+
+    lowered = message.lower()
+
+    for pattern in patterns:
+        position = lowered.find(pattern)
+
+        if position != -1:
+            value = message[position + len(pattern):]
+
+            return [
+                item.strip(" .")
+                for item in value.split(";")
+                if item.strip(" .")
+            ]
+
+    return []
+
 
 class Agent:
     """Editable weak baseline: stateless BM25 retrieval with no LLM dependency."""
@@ -73,7 +100,7 @@ class Agent:
 
     def reset(self, session_id: str, user_profile: dict) -> None:
         # The profile is anonymized and may be used for personalization.
-        self._sessions[session_id] = {"user_profile": user_profile, "history": []}
+        self._sessions[session_id] = {"user_profile": user_profile, "history": [], "constraints": []}
 
     def respond(
         self,
@@ -90,6 +117,12 @@ class Agent:
 
         state["history"].append(user_message)
 
+        new_constraints = _extract_constraints(user_message)
+
+        for constraint in new_constraints:
+            if constraint not in state["constraints"]:
+                state["constraints"].append(constraint)
+
         query = " ".join(state["history"])
 
         unique_terms = list(dict.fromkeys(_terms(query)))[:40]
@@ -98,12 +131,70 @@ class Agent:
         if not expression:
             recommendations: list[dict] = []
         else:
+            candidate_k = max(100, top_k * 10)
+
             rows = self.connection.execute(
-                "SELECT parent_asin FROM products WHERE products MATCH ? "
-                "ORDER BY bm25(products, 0.0, 6.0, 4.0, 2.5, 2.5, 1.5, 1.0) LIMIT ?",
-                (expression, top_k),
+                "SELECT parent_asin, title, categories, features, "
+                "details, store, description "
+                "FROM products WHERE products MATCH ? "
+                "ORDER BY bm25(products, 0.0, 6.0, 4.0, 2.5, 2.5, 1.5, 1.0) "
+                "LIMIT ?",
+                (expression, candidate_k),
             ).fetchall()
-            recommendations = [{"parent_asin": str(row[0])} for row in rows]
+
+            normalized_constraints = [
+                _normalize(constraint)
+                for constraint in state["constraints"]
+            ]
+
+            scored_rows = []
+
+            for bm25_rank, row in enumerate(rows):
+
+                product_text = _normalize(
+                    " ".join(
+                        str(value or "")
+                        for value in row[1:]
+                    )
+                )
+
+                matched_constraints = [
+                    constraint
+                    for constraint in normalized_constraints
+                    if constraint in product_text
+                ]
+
+                # How many full constraints does this product satisfy?
+                coverage = len(matched_constraints)
+
+                # Prefer matching more specific / longer constraints
+                specificity = sum(
+                    len(constraint.split())
+                    for constraint in matched_constraints
+                )
+
+                scored_rows.append(
+                    (
+                        coverage,
+                        specificity,
+                        bm25_rank,
+                        row,
+                    )
+                )
+
+                scored_rows.sort(
+                    key=lambda item: (
+                        -item[0],   # more constraints matched
+                        -item[1],   # more specific matches
+                        item[2],    # preserve BM25 when tied
+                    )
+)
+
+
+            recommendations = [
+                {"parent_asin": str(item[3][0])}
+                for item in scored_rows[:top_k]
+            ]
 
         # if turn <= 2:
         #     message = "What other requirements or preferences do you prefer?"
