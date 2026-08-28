@@ -13,7 +13,6 @@ STOPWORDS = {
     "that", "the", "this", "to", "want", "with", "would", "you", "looking",
 }
 
-
 def _text(value: object) -> str:
     if value is None:
         return ""
@@ -75,6 +74,37 @@ def _is_override(message: str) -> bool:
 
     return any(marker in text for marker in override_markers)
 
+def _contains_term(text: str, term: str) -> bool:
+    pattern = rf"\b{re.escape(term)}\b"
+    return re.search(pattern, text, re.I) is not None
+
+def _clean_vocab(values: list[str]) -> list[str]:
+    cleaned = set()
+
+    for value in values:
+        value = _normalize(str(value))
+
+        if not value:
+            continue
+
+        if value in STOPWORDS:
+            continue
+
+        if len(value) < 3:
+            continue
+
+        # Avoid giant accidental descriptions
+        if len(value.split()) > 6:
+            continue
+
+        cleaned.add(value)
+
+    # Longer terms first:
+    # "navy blue" before "blue"
+    return sorted(
+        cleaned,
+        key=lambda x: (-len(x.split()), -len(x))
+    )
 
 class Agent:
     """Editable weak baseline: stateless BM25 retrieval with no LLM dependency."""
@@ -84,7 +114,36 @@ class Agent:
         self.connection = sqlite3.connect(":memory:")
         self._sessions: dict[str, dict] = {}
         self.sessions = {}
+        with open("data/colors.json", encoding="utf-8") as f:
+            self.colors = _clean_vocab(json.load(f))
+
+        with open("data/materials.json", encoding="utf-8") as f:
+            self.materials = _clean_vocab(json.load(f))
         self._build_index()
+
+    def _extract_attributes(self, message: str) -> dict:
+        text = _normalize(message)
+        attributes = {}
+
+        found_colors = [
+            color
+            for color in self.colors
+            if _contains_term(text, color)
+        ]
+
+        found_materials = [
+            material
+            for material in self.materials
+            if _contains_term(text, material)
+        ]
+
+        if found_colors:
+            attributes["color"] = found_colors[0]
+
+        if found_materials:
+            attributes["material"] = found_materials[0]
+
+        return attributes
 
     def _build_index(self) -> None:
         cursor = self.connection.cursor()
@@ -117,7 +176,7 @@ class Agent:
 
     def reset(self, session_id: str, user_profile: dict) -> None:
         # The profile is anonymized and may be used for personalization.
-        self._sessions[session_id] = {"user_profile": user_profile, "history": [], "constraints": []}
+        self._sessions[session_id] = {"user_profile": user_profile, "history": [], "constraints": [], "attributes": {}}
 
     def respond(
         self,
@@ -131,6 +190,16 @@ class Agent:
 
         # add memory to the session state to save user's message
         state = self._sessions[session_id]
+        override_message = _is_override(user_message)
+
+        new_attributes = self._extract_attributes(user_message)
+
+        if override_message:
+            # User explicitly said to ignore the earlier preference
+            state["attributes"].clear()
+
+        for attribute, value in new_attributes.items():
+            state["attributes"][attribute] = value
 
         retry_message = (
             "those options are not quite right yet"
@@ -144,22 +213,20 @@ class Agent:
 
             new_constraints = _extract_constraints(user_message)
 
-            for constraint in new_constraints:
-                if constraint not in state["constraints"]:
-                    state["constraints"].append(constraint)
+            if override_message and new_constraints:
+                state["constraints"] = new_constraints.copy()
+
+            else:
+                for constraint in new_constraints:
+                    if constraint not in state["constraints"]:
+                        state["constraints"].append(constraint)
 
         profile = state["user_profile"]
         preferences = profile.get("preference_tags", [])
 
-        for constraint in new_constraints:
-            if constraint not in state["constraints"]:
-                state["constraints"].append(constraint)
-
         query = " ".join(state["history"])
 
         query_terms = _terms(query)
-
-        
 
         preference_terms = []
 
@@ -169,7 +236,7 @@ class Agent:
             )
 
         all_terms = preference_terms + query_terms
-
+        
         unique_terms = list(dict.fromkeys(all_terms))[:40]
         expression = " OR ".join(f'"{term}"' for term in unique_terms)
         if not expression:
@@ -217,8 +284,24 @@ class Agent:
                     for constraint in matched_constraints
                 )
 
+                attribute_matches = 0
+
+                for attribute, value in state["attributes"].items():
+                    normalized_value = _normalize(value)
+
+                    if (
+                        normalized_value
+                        and _contains_term(
+                            product_text,
+                            normalized_value
+                        )
+                    ):
+                        attribute_matches += 1
+
+
                 scored_rows.append(
                     (
+                        attribute_matches,
                         coverage,
                         specificity,
                         bm25_rank,
@@ -230,12 +313,13 @@ class Agent:
                 key=lambda item: (
                     -item[0],   # more constraints matched
                     -item[1],   # more specific matches
-                    item[2],    # preserve BM25 when tied
+                    -item[2],   # preserve BM25 when tied
+                    item[3]   
                 ))
 
 
             recommendations = [
-                {"parent_asin": str(item[3][0])}
+                {"parent_asin": str(item[4][0])}
                 for item in scored_rows[:top_k]
             ]
 
