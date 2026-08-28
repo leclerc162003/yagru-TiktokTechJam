@@ -176,7 +176,7 @@ class Agent:
 
     def reset(self, session_id: str, user_profile: dict) -> None:
         # The profile is anonymized and may be used for personalization.
-        self._sessions[session_id] = {"user_profile": user_profile, "history": [], "constraints": [], "attributes": {}}
+        self._sessions[session_id] = {"user_profile": user_profile, "history": [], "constraints": [], "attributes": {}, "mode": ""}
 
     def respond(
         self,
@@ -190,6 +190,16 @@ class Agent:
 
         # add memory to the session state to save user's message
         state = self._sessions[session_id]
+
+        lowered = user_message.lower()
+
+        #dual-track thing 
+        if "key requirement is" in lowered:
+            state["mode"] = "buying"
+
+        elif "still exploring" in lowered:
+            state["mode"] = "browsing"
+
         override_message = _is_override(user_message)
 
         new_attributes = self._extract_attributes(user_message)
@@ -326,9 +336,14 @@ class Agent:
                 score += 8.0 * coverage
                 score += 1.5 * specificity
 
-                #title match 
-                score += 1.0 * title_overlap
-                score += 0.75 * category_overlap
+                #title match + dual track
+
+                if state["mode"] == "buying":
+                    score += 2.5 * title_overlap
+                    score += 2.0 * category_overlap
+                else:
+                    score += 1.0 * title_overlap
+                    score += 0.75 * category_overlap
 
                 scored_rows.append(
                     (
