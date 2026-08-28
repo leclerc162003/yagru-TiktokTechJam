@@ -235,7 +235,15 @@ class Agent:
                 _terms(preference)
             )
 
-        all_terms = preference_terms + query_terms
+        # Explicit conversational evidence should dominate.
+        all_terms = query_terms.copy()
+
+        # Only use historical profile preferences when
+        # the current conversation is sparse.
+        if len(all_terms) < 8:
+            all_terms.extend(preference_terms)
+
+        unique_terms = list(dict.fromkeys(all_terms))[:40]
         
         unique_terms = list(dict.fromkeys(all_terms))[:40]
         expression = " OR ".join(f'"{term}"' for term in unique_terms)
