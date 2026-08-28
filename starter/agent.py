@@ -132,21 +132,13 @@ class Agent:
         # add memory to the session state to save user's message
         state = self._sessions[session_id]
 
-
         retry_message = (
             "those options are not quite right yet"
             in user_message.lower()
         )
 
-        # User has changed their intent.
-        # # Remove information belonging to the old request.
-        # if _is_override(user_message):
-        #     state["history"] = []
-        #     state["constraints"] = []
+        new_constraints = []
 
-        state["history"].append(user_message)
-
-        # Only store actual shopping information
         if not retry_message:
             state["history"].append(user_message)
 
@@ -167,12 +159,7 @@ class Agent:
 
         query_terms = _terms(query)
 
-        profile = state["user_profile"]
-
-        preferences = profile.get(
-            "preference_tags",
-            []
-        )
+        
 
         preference_terms = []
 
@@ -239,13 +226,12 @@ class Agent:
                     )
                 )
 
-                scored_rows.sort(
-                    key=lambda item: (
-                        -item[0],   # more constraints matched
-                        -item[1],   # more specific matches
-                        item[2],    # preserve BM25 when tied
-                    )
-)
+            scored_rows.sort(
+                key=lambda item: (
+                    -item[0],   # more constraints matched
+                    -item[1],   # more specific matches
+                    item[2],    # preserve BM25 when tied
+                ))
 
 
             recommendations = [
