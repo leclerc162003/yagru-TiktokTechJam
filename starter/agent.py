@@ -279,6 +279,19 @@ class Agent:
                     )
                 )
 
+                #finding overlaps 
+
+                title_text = _normalize(str(row[1] or ""))
+                category_text = _normalize(str(row[2] or ""))
+
+                query_term_set = set(query_terms)
+
+                title_terms = set(_terms(title_text))
+                category_terms = set(_terms(category_text))
+
+                title_overlap = len(query_term_set & title_terms)
+                category_overlap = len(query_term_set & category_terms)
+
                 matched_constraints = [
                     constraint
                     for constraint in normalized_constraints
@@ -308,14 +321,14 @@ class Agent:
 
                 score = -bm25_score
 
-                # Strong reward for extracted attributes like material/color
+                # explicit constraints
                 score += 8.0 * attribute_matches
-
-                # Strong reward for satisfying explicit user constraints
                 score += 8.0 * coverage
-
-                # Smaller reward for matching more detailed constraints
                 score += 1.5 * specificity
+
+                #title match 
+                score += 1.0 * title_overlap
+                score += 0.75 * category_overlap
 
                 scored_rows.append(
                     (
