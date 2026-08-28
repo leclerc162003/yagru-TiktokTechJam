@@ -246,9 +246,10 @@ class Agent:
 
             rows = self.connection.execute(
                 "SELECT parent_asin, title, categories, features, "
-                "details, store, description "
+                "details, store, description, "
+                "bm25(products, 0.0, 6.0, 4.0, 2.5, 2.5, 1.5, 1.0) AS bm25_score "
                 "FROM products WHERE products MATCH ? "
-                "ORDER BY bm25(products, 0.0, 6.0, 4.0, 2.5, 2.5, 1.5, 1.0) "
+                "ORDER BY bm25_score "
                 "LIMIT ?",
                 (expression, candidate_k),
             ).fetchall()
@@ -260,12 +261,13 @@ class Agent:
 
             scored_rows = []
 
-            for bm25_rank, row in enumerate(rows):
+            for row in rows:
+                bm25_score = float(row[7])
 
                 product_text = _normalize(
                     " ".join(
                         str(value or "")
-                        for value in row[1:]
+                        for value in row[1:7]
                     )
                 )
 
@@ -275,10 +277,8 @@ class Agent:
                     if constraint in product_text
                 ]
 
-                # How many full constraints does this product satisfy?
                 coverage = len(matched_constraints)
 
-                # Prefer matching more specific / longer constraints
                 specificity = sum(
                     len(constraint.split())
                     for constraint in matched_constraints
@@ -298,28 +298,34 @@ class Agent:
                     ):
                         attribute_matches += 1
 
+                score = -bm25_score
+
+                # Strong reward for extracted attributes like material/color
+                score += 8.0 * attribute_matches
+
+                # Strong reward for satisfying explicit user constraints
+                score += 8.0 * coverage
+
+                # Smaller reward for matching more detailed constraints
+                score += 1.5 * specificity
 
                 scored_rows.append(
                     (
-                        attribute_matches,
-                        coverage,
-                        specificity,
-                        bm25_rank,
+                        score,
                         row,
                     )
                 )
 
             scored_rows.sort(
-                key=lambda item: (
-                    -item[0],   # more constraints matched
-                    -item[1],   # more specific matches
-                    -item[2],   # preserve BM25 when tied
-                    item[3]   
-                ))
+                key=lambda item: -item[0]
+            )
 
 
             recommendations = [
-                {"parent_asin": str(item[4][0])}
+                {
+                    "parent_asin": str(item[1][0]),
+                    "score": round(item[0], 6),
+                }
                 for item in scored_rows[:top_k]
             ]
 
