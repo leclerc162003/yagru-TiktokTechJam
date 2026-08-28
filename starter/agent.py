@@ -104,9 +104,34 @@ class Agent:
                 (expression, top_k),
             ).fetchall()
             recommendations = [{"parent_asin": str(row[0])} for row in rows]
+
+        # if turn <= 2:
+        #     message = "What other requirements or preferences do you prefer?"
+        #     ask_attribute = "other"
+        # else:
+        #     message = "Here are the closest matches I found."
+        #     ask_attribute = None
+
+        # if turn <= 1:
+        #     message = "What other requirements or preferences do you prefer?"
+        #     ask_attribute = "other"
+        # else:
+        #     message = "Here are the closest matches I found."
+        #     ask_attribute = None
+
+        if turn <= 3:
+            message = "What other requirements or preferences do you prefer?"
+            ask_attribute = "other"
+        else:
+            message = "Here are the closest matches I found."
+            ask_attribute = None
+        
+
+            
+        
         return {
-            "message": "Here are the closest matches I found.",
-            "ask_attribute": None,
+            "message": message,
+            "ask_attribute": ask_attribute,
             "recommendations": recommendations,
             "usage": {"prompt_tokens": 0, "completion_tokens": 0},
         }
