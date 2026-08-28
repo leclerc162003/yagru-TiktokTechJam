@@ -289,6 +289,23 @@ class Agent:
                     )
                 )
 
+                product_terms = set(_terms(product_text))
+
+                #checking constraint overlap 
+
+                constraint_overlap_score = 0.0
+
+                for constraint in normalized_constraints:
+                    constraint_terms = set(_terms(constraint))
+
+                    if not constraint_terms:
+                        continue
+
+                    overlap = len(
+                        constraint_terms & product_terms
+                    ) / len(constraint_terms)
+
+                    constraint_overlap_score += overlap
                 #finding overlaps 
 
                 title_text = _normalize(str(row[1] or ""))
@@ -341,6 +358,8 @@ class Agent:
                 if state["mode"] == "buying":
                     score += 2.5 * title_overlap
                     score += 2.0 * category_overlap
+                    #constraint overlap boost
+                    score += 6.0 * constraint_overlap_score
                 else:
                     score += 1.0 * title_overlap
                     score += 0.75 * category_overlap
