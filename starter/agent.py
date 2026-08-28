@@ -115,18 +115,45 @@ class Agent:
         # add memory to the session state to save user's message
         state = self._sessions[session_id]
 
-        state["history"].append(user_message)
+        retry_message = (
+            "those options are not quite right yet"
+            in user_message.lower()
+        )
 
-        new_constraints = _extract_constraints(user_message)
+        # Only store actual shopping information
+        if not retry_message:
+            state["history"].append(user_message)
 
-        for constraint in new_constraints:
-            if constraint not in state["constraints"]:
-                state["constraints"].append(constraint)
+            new_constraints = _extract_constraints(user_message)
+
+            for constraint in new_constraints:
+                if constraint not in state["constraints"]:
+                    state["constraints"].append(constraint)
+
+        profile = state["user_profile"]
+        preferences = profile.get("preference_tags", [])
 
         query = " ".join(state["history"])
 
-        unique_terms = list(dict.fromkeys(_terms(query)))[:40]
+        query_terms = _terms(query)
 
+        profile = state["user_profile"]
+
+        preferences = profile.get(
+            "preference_tags",
+            []
+        )
+
+        preference_terms = []
+
+        for preference in preferences:
+            preference_terms.extend(
+                _terms(preference)
+            )
+
+        all_terms = preference_terms + query_terms
+
+        unique_terms = list(dict.fromkeys(all_terms))[:40]
         expression = " OR ".join(f'"{term}"' for term in unique_terms)
         if not expression:
             recommendations: list[dict] = []
@@ -210,15 +237,30 @@ class Agent:
         #     message = "Here are the closest matches I found."
         #     ask_attribute = None
 
-        if turn <= 3:
-            message = "What other requirements or preferences do you prefer?"
-            ask_attribute = "other"
-        else:
-            message = "Here are the closest matches I found."
-            ask_attribute = None
-        
 
-            
+        # if turn <= 3:
+        #     message = "What other requirements or preferences do you prefer?"
+        #     ask_attribute = "other"
+        # else:
+        #     message = "Here are the closest matches I found."
+        #     ask_attribute = None
+        
+        # current_terms = _terms(user_message)
+        # if retry_message:
+        #     message = "Can you tell me one more specific product attribute you care about?"
+        #     ask_attribute = "TODO"
+        # elif len(current_terms) <= 1 and not state["constraints"]:
+        #     message = "What will you use it for, and what features matter most?"
+        #     ask_attribute = "TODO"
+        # else:
+
+
+        message = (
+            "Here are the closest matches I found. "
+            "What other requirement matters to you?"
+        )
+
+        ask_attribute = "other"
         
         return {
             "message": message,
