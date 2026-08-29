@@ -4,6 +4,7 @@ import json
 import math
 import re
 import sqlite3
+import sys
 from pathlib import Path
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -272,16 +273,9 @@ class SessionState:
         )
         return " ".join(part for part in parts if part)
 
-@dataclass
+@dataclass(slots=True)
 class ProductDoc:
-    parent_asin: str
-    title: str
     categories: str
-    features: str
-    details: str
-    store: str
-    description: str
-
     all_text: str
 
     terms: set[str]
@@ -304,11 +298,14 @@ def _text(value: object) -> str:
 
 
 def _terms(text: str) -> list[str]:
-    return [
-        token.lower()
-        for token in TOKEN_RE.findall(text)
-        if len(token) > 1 and token.lower() not in STOPWORDS
-    ]
+    terms = []
+
+    for token in TOKEN_RE.findall(text):
+        normalized = token.lower()
+        if len(normalized) > 1 and normalized not in STOPWORDS:
+            terms.append(sys.intern(normalized))
+
+    return terms
 
 def _normalize(text: str) -> str:
     return " ".join(TOKEN_RE.findall(text.lower()))
@@ -491,15 +488,15 @@ def _intent_values(product: dict) -> set[str]:
 
 def _stem_token(token: str) -> str:
     if len(token) > 4 and token.endswith("ies"):
-        return f"{token[:-3]}y"
+        return sys.intern(f"{token[:-3]}y")
 
     if len(token) > 4 and token.endswith("es"):
-        return token[:-2]
+        return sys.intern(token[:-2])
 
     if len(token) > 3 and token.endswith("s"):
-        return token[:-1]
+        return sys.intern(token[:-1])
 
-    return token
+    return sys.intern(token)
 
 
 
@@ -517,10 +514,19 @@ class Agent:
         self._rating_count: dict[str, float] = {}
         self._attribute_parse_cache: dict[str, dict[str, str]] = {}
         self.sessions = {}
-        with open("data/colors.json", encoding="utf-8") as f:
+        catalog_data_dir = self.catalog_path.resolve().parent
+        bundled_data_dir = Path(__file__).resolve().parents[1] / "data"
+
+        def resource_path(filename: str) -> Path:
+            catalog_resource = catalog_data_dir / filename
+            if catalog_resource.is_file():
+                return catalog_resource
+            return bundled_data_dir / filename
+
+        with resource_path("colors.json").open(encoding="utf-8") as f:
             self.colors = _clean_vocab(json.load(f))
 
-        with open("data/materials.json", encoding="utf-8") as f:
+        with resource_path("materials.json").open(encoding="utf-8") as f:
             self.materials = _clean_vocab(json.load(f))
         self._build_index()
 
@@ -980,13 +986,7 @@ class Agent:
                 }
 
                 self._products[parent_asin] = ProductDoc(
-                    parent_asin=parent_asin,
-                    title=title,
                     categories=categories,
-                    features=features,
-                    details=details,
-                    store=store,
-                    description=description,
                     all_text=all_text,
                     terms=terms,
                     title_terms=title_terms,
