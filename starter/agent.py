@@ -4,7 +4,7 @@ import json
 import re
 import sqlite3
 from pathlib import Path
-
+from collections import defaultdict
 from dataclasses import dataclass, field
 
 
@@ -93,6 +93,8 @@ class ProductDoc:
     terms: set[str]
     title_terms: set[str]
     category_terms: set[str]
+
+    intent_values: set[str]
 
 def _text(value: object) -> str:
     if value is None:
@@ -187,6 +189,42 @@ def _clean_vocab(values: list[str]) -> list[str]:
         key=lambda x: (-len(x.split()), -len(x))
     )
 
+def _flatten_values(value: object) -> list[str]:
+    if isinstance(value, dict):
+        return [
+            f"{key}: {item}"
+            for key, item in value.items()
+            if item not in (None, "", [])
+        ]
+
+    if isinstance(value, list):
+        return [
+            str(item)
+            for item in value
+            if item not in (None, "")
+        ]
+
+    if value not in (None, ""):
+        return [str(value)]
+
+    return []
+
+def _normalize_constraint(value: object) -> str:
+    return _normalize(str(value))
+
+def _intent_values(product: dict) -> set[str]:
+
+    candidates = [
+        *_flatten_values(product.get("features")),
+        *_flatten_values(product.get("details")),
+    ]
+
+    return {
+        _normalize_constraint(item)
+        for item in candidates
+        if _normalize_constraint(item)
+    }
+
 
 
 class Agent:
@@ -197,6 +235,7 @@ class Agent:
         self.connection = sqlite3.connect(":memory:")
         self._sessions: dict[str, SessionState] = {}
         self._products: dict[str, ProductDoc] = {}
+        self._constraint_index: dict[str, list[str]] = defaultdict(list)
         self.sessions = {}
         with open("data/colors.json", encoding="utf-8") as f:
             self.colors = _clean_vocab(json.load(f))
@@ -308,6 +347,8 @@ class Agent:
             for line in handle:
                 product = json.loads(line)
 
+                intent_values = _intent_values(product)
+
                 parent_asin = str(product["parent_asin"])
 
                 title = _text(product.get("title"))
@@ -346,7 +387,11 @@ class Agent:
                     terms=terms,
                     title_terms=title_terms,
                     category_terms=category_terms,
+                    intent_values=intent_values
                 )
+
+                for value in intent_values:
+                    self._constraint_index[value].append(parent_asin)
 
                 batch.append(
                     (
@@ -359,6 +404,11 @@ class Agent:
                         description,
                     )
                 )
+
+                if len(batch) >= 1000:
+                    cursor.executemany("INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
+                    batch.clear()
+
         if batch:
             cursor.executemany("INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
         self.connection.commit()
@@ -366,6 +416,33 @@ class Agent:
     def reset(self, session_id: str, user_profile: dict) -> None:
         # The profile is anonymized and may be used for personalization.
        self._sessions[session_id] = SessionState(user_profile=user_profile)
+
+    def _exact_constraint_candidates(
+        self,
+        state: SessionState,
+    ) -> set[str]:
+
+        candidate_sets = []
+
+        for constraint in state.constraints:
+            key = _normalize_constraint(constraint)
+
+            exact = set(
+                self._constraint_index.get(key, [])
+            )
+
+            if exact:
+                candidate_sets.append(exact)
+
+        if not candidate_sets:
+            return set()
+
+        candidates = set.intersection(*candidate_sets)
+
+        if not candidates:
+            candidates = set.union(*candidate_sets)
+
+        return candidates
 
 
     def respond(
@@ -462,6 +539,21 @@ class Agent:
                 (expression, candidate_k),
             ).fetchall()
 
+
+            # BM25 candidates
+            candidate_scores = {
+                str(row[0]): float(row[7])
+                for row in rows
+            }
+
+
+            # Exact constraint candidates
+            exact_candidates = self._exact_constraint_candidates(state)
+
+            for parent_asin in exact_candidates:
+                candidate_scores.setdefault(parent_asin, 0.0)
+
+
             normalized_constraints = [
                 _normalize(constraint)
                 for constraint in state.constraints
@@ -469,11 +561,9 @@ class Agent:
 
             scored_rows = []
 
-            for row in rows:
 
-                bm25_score = float(row[7])
+            for parent_asin, bm25_score in candidate_scores.items():
 
-                parent_asin = str(row[0])
                 product = self._products[parent_asin]
 
                 constraint_overlap_score = 0.0
@@ -531,19 +621,27 @@ class Agent:
                     ):
                         attribute_matches += 1
 
+                exact_constraint_matches = 0
+
+                for constraint in state.constraints:
+                    normalized_constraint = _normalize_constraint(
+                        constraint
+                    )
+
+                    if normalized_constraint in product.intent_values:
+                        exact_constraint_matches += 1
+
                 score = -bm25_score
 
-                # explicit constraints
                 score += 8.0 * attribute_matches
                 score += 8.0 * coverage
                 score += 1.5 * specificity
 
-                #title match + dual track
+                score += 8.0 * exact_constraint_matches
 
                 if state.mode == "buying":
                     score += 2.5 * title_overlap
                     score += 2.0 * category_overlap
-                    #constraint overlap boost
                     score += 6.0 * constraint_overlap_score
                 else:
                     score += 1.0 * title_overlap
@@ -552,9 +650,10 @@ class Agent:
                 scored_rows.append(
                     (
                         score,
-                        row,
+                        parent_asin,
                     )
                 )
+
 
             scored_rows.sort(
                 key=lambda item: -item[0]
@@ -563,7 +662,7 @@ class Agent:
 
             recommendations = [
                 {
-                    "parent_asin": str(item[1][0]),
+                    "parent_asin": item[1],
                     "score": round(item[0], 6),
                 }
                 for item in scored_rows[:top_k]
