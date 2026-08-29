@@ -219,11 +219,15 @@ def _intent_values(product: dict) -> set[str]:
         *_flatten_values(product.get("details")),
     ]
 
-    return {
-        _normalize_constraint(item)
-        for item in candidates
-        if _normalize_constraint(item)
-    }
+    values = set()
+
+    for item in candidates:
+        normalized = _normalize_constraint(item)
+
+        if normalized:
+            values.add(normalized)
+
+    return values
 
 
 
@@ -235,7 +239,7 @@ class Agent:
         self.connection = sqlite3.connect(":memory:")
         self._sessions: dict[str, SessionState] = {}
         self._products: dict[str, ProductDoc] = {}
-        self._constraint_index: dict[str, list[str]] = defaultdict(list)
+        self._constraint_index: dict[str, list[str]] = defaultdict(set)
         self.sessions = {}
         with open("data/colors.json", encoding="utf-8") as f:
             self.colors = _clean_vocab(json.load(f))
@@ -391,7 +395,7 @@ class Agent:
                 )
 
                 for value in intent_values:
-                    self._constraint_index[value].append(parent_asin)
+                    self._constraint_index[value].add(parent_asin)
 
                 batch.append(
                     (
@@ -427,11 +431,12 @@ class Agent:
         for constraint in state.constraints:
             key = _normalize_constraint(constraint)
 
-            exact = set(
-                self._constraint_index.get(key, [])
+            exact = self._constraint_index.get(
+                key,
+                set(),
             )
 
-            if exact:
+            if exact and len(exact) <= 500:
                 candidate_sets.append(exact)
 
         if not candidate_sets:
@@ -530,8 +535,7 @@ class Agent:
             candidate_k = max(100, top_k * 10)
 
             rows = self.connection.execute(
-                "SELECT parent_asin, title, categories, features, "
-                "details, store, description, "
+                "SELECT parent_asin, "
                 "bm25(products, 0.0, 6.0, 4.0, 2.5, 2.5, 1.5, 1.0) AS bm25_score "
                 "FROM products WHERE products MATCH ? "
                 "ORDER BY bm25_score "
@@ -542,10 +546,9 @@ class Agent:
 
             # BM25 candidates
             candidate_scores = {
-                str(row[0]): float(row[7])
+                str(row[0]): float(row[1])
                 for row in rows
             }
-
 
             # Exact constraint candidates
             exact_candidates = self._exact_constraint_candidates(state)
@@ -560,6 +563,8 @@ class Agent:
             ]
 
             scored_rows = []
+
+            query_term_set = set(query_terms)
 
 
             for parent_asin, bm25_score in candidate_scores.items():
@@ -583,7 +588,7 @@ class Agent:
 
                     constraint_overlap_score += overlap
 
-                query_term_set = set(query_terms)
+                
 
                 title_overlap = len(
                     query_term_set & product.title_terms
