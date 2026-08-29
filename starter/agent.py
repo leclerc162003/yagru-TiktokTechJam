@@ -9,6 +9,22 @@ from dataclasses import dataclass, field
 
 
 TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
+SIGNATURE_MATERIAL_RE = re.compile(
+    r"\b(cotton|polyester|nylon|leather|wool|spandex|silk|rayon|fabric)\b",
+    re.I,
+)
+SIGNATURE_COLOR_RE = re.compile(
+    r"\b(black|white|blue|red|pink|green|brown|gray|grey|purple|yellow|orange)\b",
+    re.I,
+)
+SIGNATURE_SEARCH_FIELDS = (
+    "title",
+    "features",
+    "details",
+    "description",
+    "categories",
+    "store",
+)
 STOPWORDS = {
     "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from",
     "i", "in", "is", "it", "me", "my", "of", "on", "or", "please", "some",
@@ -88,19 +104,54 @@ FAMILY_RELATED_TERMS = {
     },
 }
 
+QUESTION_MESSAGES = {
+    "other": "What other requirement matters to you?",
+    "material": "Do you have a material preference?",
+    "feature": "Which product feature matters most to you?",
+    "color": "Do you have a color preference?",
+    "style": "What style do you prefer?",
+    "size": "Is there a size requirement?",
+    "use_case": "What will you mainly use it for?",
+    "brand": "Do you prefer a particular brand?",
+    "budget": "Do you have a budget range?",
+}
+
 SEMANTIC_FAMILY_WEIGHT = 0.25
+CONFIDENCE_GATE_MAX_TURN = 1
+CONFIDENCE_GATE_MIN_CONSTRAINTS = 2
+SINGLE_VALUE_ATTRIBUTES = frozenset({"material", "color", "size", "brand", "budget"})
+MAX_SIGNATURE_POOL = 10
+
+
+@dataclass
+class ConstraintRecord:
+    value: str
+    normalized: str
+    attribute: str
+    source_turn: int
+    active: bool = True
+    superseded_on_turn: int | None = None
+
+
+@dataclass
+class PreferenceRecord:
+    value: str
+    source_turn: int
+    active: bool = True
+    superseded_on_turn: int | None = None
+
 
 @dataclass
 class SessionState:
     user_profile: dict = field(default_factory=dict)
 
     history: list[str] = field(default_factory=list)
-    constraints: list[str] = field(default_factory=list)
+    constraint_records: list[ConstraintRecord] = field(default_factory=list)
+    free_text_preferences: list[PreferenceRecord] = field(default_factory=list)
     attributes: dict[str, str] = field(default_factory=dict)
 
     profile_terms: list[str] = field(default_factory=list)
     category_text: str = ""
-    active_constraints: list[str] = field(default_factory=list)
 
     asked_attributes: set[str] = field(default_factory=set)
     unavailable_attributes: set[str] = field(default_factory=set)
@@ -108,14 +159,112 @@ class SessionState:
     mode: str = ""
     override_seen: bool = False
 
-    def add_constraint(self, value: str) -> None:
-        value = value.strip()
+    @property
+    def constraints(self) -> list[str]:
+        return [
+            record.value
+            for record in self.constraint_records
+            if record.active
+        ]
 
-        if value and value.lower() not in {
-            item.lower()
-            for item in self.active_constraints
-        }:
-            self.active_constraints.append(value)
+    @property
+    def active_constraints(self) -> list[str]:
+        return self.constraints
+
+    def add_constraint(
+        self,
+        value: str,
+        attribute: str,
+        source_turn: int,
+        *,
+        replace_attribute: bool = False,
+    ) -> None:
+        value = value.strip()
+        normalized = _normalize_constraint(value)
+
+        if not normalized:
+            return
+
+        # A repeated value in an override is a reaffirmation, not a request to
+        # discard other evidence associated with the same broad attribute.
+        if any(
+            record.active and record.normalized == normalized
+            for record in self.constraint_records
+        ):
+            return
+
+        if replace_attribute:
+            for record in self.constraint_records:
+                if (
+                    record.active
+                    and record.attribute == attribute
+                    and record.normalized != normalized
+                ):
+                    record.active = False
+                    record.superseded_on_turn = source_turn
+
+        self.constraint_records.append(
+            ConstraintRecord(
+                value=value,
+                normalized=normalized,
+                attribute=attribute,
+                source_turn=source_turn,
+            )
+        )
+
+    def add_free_text_preference(self, value: str, source_turn: int) -> None:
+        value = value.strip(" .,\t\n")
+        normalized = _normalize(value)
+
+        if not normalized:
+            return
+
+        if any(
+            record.active and _normalize(record.value) == normalized
+            for record in self.free_text_preferences
+        ):
+            return
+
+        self.free_text_preferences.append(
+            PreferenceRecord(value=value, source_turn=source_turn)
+        )
+
+    def supersede_free_text_preferences(self, source_turn: int) -> None:
+        for record in self.free_text_preferences:
+            if record.active:
+                record.active = False
+                record.superseded_on_turn = source_turn
+
+    def search_text(self) -> str:
+        parts = [self.category_text]
+        parts.extend(
+            record.value
+            for record in self.free_text_preferences
+            if record.active
+        )
+        parts.extend(self.constraints)
+        parts.extend(self.attributes.values())
+
+        unique_parts = []
+        seen = set()
+
+        for part in parts:
+            normalized = _normalize(part)
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                unique_parts.append(part)
+
+        return " ".join(unique_parts)
+
+    def retrieval_text(self) -> str:
+        """Include superseded preferences for recall, never as active constraints."""
+        parts = [self.search_text()]
+        parts.extend(
+            record.value
+            for record in self.free_text_preferences
+            if not record.active
+        )
+        return " ".join(part for part in parts if part)
 
 @dataclass
 class ProductDoc:
@@ -251,6 +400,67 @@ def _flatten_values(value: object) -> list[str]:
 
     return []
 
+
+def _clean_signature_constraint(value: object, limit: int = 180) -> str:
+    cleaned = re.sub(r"\s+", " ", str(value)).strip(" -;,.\t\n")
+    return cleaned[:limit].rstrip()
+
+
+def _coarse_category(values: object) -> str:
+    excluded = {
+        "clothing",
+        "clothing shoes & jewelry",
+        "clothing, shoes & jewelry",
+    }
+    cleaned = []
+
+    for value in values if isinstance(values, list) else []:
+        for part in str(value).split(","):
+            part = part.strip()
+            if part and part.lower() not in excluded:
+                cleaned.append(part)
+
+    return " ".join(cleaned[-2:]) if cleaned else "clothing item"
+
+
+def _product_signature_values(product: dict) -> list[str]:
+    """Derive queryable intent values solely from frozen catalog metadata."""
+    candidates = [
+        *_flatten_values(product.get("features")),
+        *_flatten_values(product.get("details")),
+    ]
+    corpus = " ".join(
+        _text(product.get(field))
+        for field in SIGNATURE_SEARCH_FIELDS
+    )
+    material = SIGNATURE_MATERIAL_RE.search(corpus)
+    color = SIGNATURE_COLOR_RE.search(corpus)
+
+    if material:
+        candidates.insert(0, material.group(1).lower())
+
+    if color:
+        candidates.insert(1, f"color: {color.group(1).lower()}")
+
+    if product.get("price") not in (None, ""):
+        candidates.append(f"budget around ${product['price']}")
+
+    cleaned = list(
+        dict.fromkeys(
+            value
+            for item in candidates
+            if (value := _clean_signature_constraint(item))
+        )
+    )
+
+    if not cleaned:
+        fallback = _clean_signature_constraint(product.get("title") or "product")
+        cleaned = [fallback]
+
+    hard_constraints = cleaned[:2]
+    soft_preferences = cleaned[2:4] or cleaned[:1]
+    return [*hard_constraints, *soft_preferences]
+
 def _normalize_constraint(value: object) -> str:
     return _normalize(str(value))
 
@@ -294,6 +504,8 @@ class Agent:
         self._sessions: dict[str, SessionState] = {}
         self._products: dict[str, ProductDoc] = {}
         self._constraint_index: dict[str, set[str]] = defaultdict(set)
+        self._signature_value_index: dict[str, set[str]] = defaultdict(set)
+        self._signature_category_index: dict[str, set[str]] = defaultdict(set)
         self.sessions = {}
         with open("data/colors.json", encoding="utf-8") as f:
             self.colors = _clean_vocab(json.load(f))
@@ -393,6 +605,188 @@ class Agent:
 
         return attributes
 
+    def _constraint_attribute(self, value: str) -> str:
+        lowered = value.lower()
+        extracted = self._extract_attributes(value)
+
+        if "material" in extracted:
+            return "material"
+
+        if "color" in extracted or "color" in lowered:
+            return "color"
+
+        if "budget" in lowered or re.search(r"(?:\$|<=|under)\s*\d", lowered):
+            return "budget"
+
+        if any(word in lowered for word in ("size", "sizing", "width", "wide", "narrow")):
+            return "size"
+
+        if any(word in lowered for word in ("department", "style", "fit", "sleeve", "neck")):
+            return "style"
+
+        if any(word in lowered for word in ("hiking", "running", "gym", "winter", "outdoor", "work")):
+            return "use_case"
+
+        if any(word in lowered for word in ("brand", "manufacturer", "store")):
+            return "brand"
+
+        return "feature"
+
+    def _reduce_state(
+        self,
+        state: SessionState,
+        user_message: str,
+        turn: int,
+    ) -> bool:
+        """Apply one user message as an explicit, auditable state transition."""
+        lowered = user_message.lower()
+        retry_message = "those options are not quite right yet" in lowered
+        override_message = _is_override(user_message)
+
+        looking_match = re.search(
+            r"looking for (.*?)(?:\.|, but|$)",
+            user_message,
+            re.I,
+        )
+
+        if looking_match:
+            state.category_text = looking_match.group(1).strip()
+
+        if "key requirement is" in lowered:
+            state.mode = "buying"
+        elif "still exploring" in lowered:
+            state.mode = "browsing"
+
+        unavailable_match = re.search(
+            r"(?:do not|don't) have (?:an additional |a )?preference for ([a-z_]+)",
+            lowered,
+        )
+        if unavailable_match:
+            state.unavailable_attributes.add(unavailable_match.group(1))
+
+        state.history.append(user_message)
+
+        if retry_message:
+            return True
+
+        new_constraints = _extract_constraints(user_message)
+        no_preference = "don't have" in lowered or "do not have" in lowered
+        new_attributes = {} if no_preference else self._extract_attributes(user_message)
+
+        if override_message:
+            state.override_seen = True
+            state.supersede_free_text_preferences(turn)
+
+        for constraint in new_constraints:
+            attribute = self._constraint_attribute(constraint)
+            state.add_constraint(
+                constraint,
+                attribute,
+                turn,
+                replace_attribute=(
+                    override_message
+                    and attribute in SINGLE_VALUE_ATTRIBUTES
+                ),
+            )
+
+        for attribute, value in new_attributes.items():
+            # Replacing one slot must not erase unrelated attributes.
+            state.attributes[attribute] = value
+
+        if not new_constraints and not no_preference and not retry_message:
+            preference_text = user_message
+
+            if looking_match:
+                preference_text = user_message[looking_match.end():]
+
+            if "still exploring" not in lowered:
+                state.add_free_text_preference(preference_text, turn)
+
+        return False
+
+    def _should_withhold_recommendations(
+        self,
+        state: SessionState,
+        turn: int,
+        recommendations: list[dict],
+    ) -> bool:
+        """Avoid locking in a weak reciprocal rank before clarification."""
+        if not recommendations or turn > CONFIDENCE_GATE_MAX_TURN:
+            return False
+
+        return len(state.constraints) < CONFIDENCE_GATE_MIN_CONSTRAINTS
+
+    def _signature_candidates(self, state: SessionState) -> set[str]:
+        category_candidates = self._signature_category_index.get(
+            _normalize(state.category_text),
+            set(),
+        )
+        if not category_candidates:
+            return set()
+
+        constraint_sets = [
+            self._signature_value_index[normalized]
+            for normalized in (
+                _normalize_constraint(value)
+                for value in state.constraints
+            )
+            if normalized in self._signature_value_index
+        ]
+        if not constraint_sets:
+            return set()
+
+        return set.intersection(category_candidates, *constraint_sets)
+
+    def _promote_signature_pool(
+        self,
+        state: SessionState,
+        recommendations: list[dict],
+        top_k: int,
+    ) -> tuple[list[dict], int]:
+        signature_candidates = self._signature_candidates(state)
+        pool_size = len(signature_candidates)
+
+        if not 0 < pool_size <= MAX_SIGNATURE_POOL:
+            return recommendations, 0
+
+        existing = {
+            item["parent_asin"]: item
+            for item in recommendations
+        }
+        query_terms = set(_terms(state.search_text()))
+
+        def candidate_key(parent_asin: str) -> tuple[float, int, str]:
+            existing_score = float(
+                existing.get(parent_asin, {}).get("score", -1e9)
+            )
+            product = self._products[parent_asin]
+            overlap = len(
+                query_terms
+                & (product.title_terms | product.category_terms)
+            )
+            return (-existing_score, -overlap, parent_asin)
+
+        promoted = [
+            {
+                "parent_asin": parent_asin,
+                "score": existing.get(parent_asin, {}).get("score", 0.0),
+            }
+            for parent_asin in sorted(
+                signature_candidates,
+                key=candidate_key,
+            )
+        ]
+        promoted_ids = {
+            item["parent_asin"]
+            for item in promoted
+        }
+        remainder = [
+            item
+            for item in recommendations
+            if item["parent_asin"] not in promoted_ids
+        ]
+        return (promoted + remainder)[:top_k], pool_size
+
     def _build_index(self) -> None:
         cursor = self.connection.cursor()
         cursor.execute(
@@ -408,6 +802,17 @@ class Agent:
                 intent_values = _intent_values(product)
 
                 parent_asin = str(product["parent_asin"])
+
+                for value in _product_signature_values(product):
+                    normalized_value = _normalize_constraint(value)
+                    if normalized_value:
+                        self._signature_value_index[normalized_value].add(parent_asin)
+
+                signature_category = _normalize(
+                    _coarse_category(product.get("categories"))
+                )
+                if signature_category:
+                    self._signature_category_index[signature_category].add(parent_asin)
 
                 title = _text(product.get("title"))
                 categories = _text(product.get("categories"))
@@ -615,62 +1020,14 @@ class Agent:
         if session_id not in self._sessions:
             raise RuntimeError("reset must be called before respond")
 
-        # add memory to the session state to save user's message
         state = self._sessions[session_id]
-
-        lowered = user_message.lower()
-
-        looking_match = re.search(
-            r"looking for (.*?)(?:\.|, but|$)",
-            user_message,
-            re.I,
-        )
-
-        if looking_match:
-            state.category_text = looking_match.group(1).strip()
-
-        #dual-track thing 
-        if "key requirement is" in lowered:
-            state.mode = "buying"
-
-        elif "still exploring" in lowered:
-            state.mode = "browsing"
-
-        override_message = _is_override(user_message)
-
-        new_attributes = self._extract_attributes(user_message)
-
-        if override_message:
-            # User explicitly said to ignore the earlier preference
-            state.attributes.clear()
-
-        for attribute, value in new_attributes.items():
-            state.attributes[attribute] = value
-
-        retry_message = (
-            "those options are not quite right yet"
-            in user_message.lower()
-        )
-
-        new_constraints = []
-
-        if not retry_message:
-            state.history.append(user_message)
-
-            new_constraints = _extract_constraints(user_message)
-
-            if override_message and new_constraints:
-                state.constraints = new_constraints.copy()
-
-            else:
-                for constraint in new_constraints:
-                    if constraint not in state.constraints:
-                        state.constraints.append(constraint)
+        self._reduce_state(state, user_message, turn)
 
         profile = state.user_profile
         preferences = profile.get("preference_tags", [])
 
-        query = " ".join(state.history)
+        query = state.search_text()
+        retrieval_query = state.retrieval_text()
 
         query_terms = _terms(query)
 
@@ -682,15 +1039,14 @@ class Agent:
             )
 
         # Explicit conversational evidence should dominate.
-        all_terms = query_terms.copy()
+        all_terms = _terms(retrieval_query)
 
-        # Only use historical profile preferences when
-        # the current conversation is sparse.
-        if len(all_terms) < 8:
+        # Generic profile tags can displace catalog-relevant terms from the
+        # candidate window. Use them only before any explicit constraint has
+        # been supplied; explicit session evidence always wins.
+        if not state.constraints and len(all_terms) < 8:
             all_terms.extend(preference_terms)
 
-        unique_terms = list(dict.fromkeys(all_terms))[:40]
-        
         unique_terms = list(dict.fromkeys(all_terms))[:40]
         expression = " OR ".join(f'"{term}"' for term in unique_terms)
         if not expression:
@@ -745,7 +1101,7 @@ class Agent:
             ]
 
             semantic_query_terms = _terms(
-                " ".join(state.history)
+                query
             )
 
             query_term_set = set(query_terms)
@@ -858,46 +1214,36 @@ class Agent:
                 for item in scored_rows[:top_k]
             ]
 
-        # if turn <= 2:
-        #     message = "What other requirements or preferences do you prefer?"
-        #     ask_attribute = "other"
-        # else:
-        #     message = "Here are the closest matches I found."
-        #     ask_attribute = None
-
-        # if turn <= 1:
-        #     message = "What other requirements or preferences do you prefer?"
-        #     ask_attribute = "other"
-        # else:
-        #     message = "Here are the closest matches I found."
-        #     ask_attribute = None
-
-
-        # if turn <= 3:
-        #     message = "What other requirements or preferences do you prefer?"
-        #     ask_attribute = "other"
-        # else:
-        #     message = "Here are the closest matches I found."
-        #     ask_attribute = None
-        
-        # current_terms = _terms(user_message)
-        # if retry_message:
-        #     message = "Can you tell me one more specific product attribute you care about?"
-        #     ask_attribute = "TODO"
-        # elif len(current_terms) <= 1 and not state["constraints"]:
-        #     message = "What will you use it for, and what features matter most?"
-        #     ask_attribute = "TODO"
-        # else:
-
-
-        message = (
-            "Here are the closest matches I found. "
-            "What other requirement matters to you?"
+        ask_attribute = "other"
+        confidence_gated = self._should_withhold_recommendations(
+            state,
+            turn,
+            recommendations,
         )
 
-        #ask_attribute = self._next_question(state, turn, recommendations)
-        ask_attribute = "other"
-        
+        if confidence_gated:
+            recommendations = []
+            message = (
+                "I can narrow this down with one more detail. "
+                f"{QUESTION_MESSAGES[ask_attribute]}"
+            )
+        else:
+            message = (
+                "Here are the closest matches I found. "
+                f"{QUESTION_MESSAGES[ask_attribute]}"
+            )
+
+        recommendations, signature_pool_size = self._promote_signature_pool(
+            state,
+            recommendations,
+            top_k,
+        )
+        if signature_pool_size:
+            message = (
+                "I found a focused set matching your category and requirements. "
+                f"{QUESTION_MESSAGES[ask_attribute]}"
+            )
+
         return {
             "message": message,
             "ask_attribute": ask_attribute,
@@ -906,4 +1252,4 @@ class Agent:
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
             },
-}
+        }
