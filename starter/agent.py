@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import sqlite3
 from pathlib import Path
@@ -121,6 +122,7 @@ CONFIDENCE_GATE_MAX_TURN = 1
 CONFIDENCE_GATE_MIN_CONSTRAINTS = 2
 SINGLE_VALUE_ATTRIBUTES = frozenset({"material", "color", "size", "brand", "budget"})
 MAX_SIGNATURE_POOL = 10
+POPULARITY_PRIOR_WEIGHT = 6.0
 
 
 @dataclass
@@ -798,6 +800,36 @@ class Agent:
         ]
         return (promoted + remainder)[:top_k], pool_size
 
+    def _rerank_with_popularity_prior(
+        self,
+        state: SessionState,
+        recommendations: list[dict],
+    ) -> list[dict]:
+        """Blend relevance with a log-scaled popularity prior when unfocused."""
+        if len(recommendations) < 2:
+            return recommendations
+
+        signature_pool_size = len(self._signature_candidates(state))
+        if 0 < signature_pool_size <= MAX_SIGNATURE_POOL:
+            return recommendations
+
+        return sorted(
+            recommendations,
+            key=lambda item: (
+                -(
+                    float(item.get("score", 0.0))
+                    + POPULARITY_PRIOR_WEIGHT
+                    * math.log1p(
+                        max(
+                            0.0,
+                            self._rating_count.get(item["parent_asin"], 0.0),
+                        )
+                    )
+                ),
+                item["parent_asin"],
+            ),
+        )
+
     def _build_index(self) -> None:
         cursor = self.connection.cursor()
         cursor.execute(
@@ -1251,6 +1283,10 @@ class Agent:
             state,
             recommendations,
             top_k,
+        )
+        recommendations = self._rerank_with_popularity_prior(
+            state,
+            recommendations,
         )
         if signature_pool_size:
             message = (
