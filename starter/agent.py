@@ -5,6 +5,8 @@ import re
 import sqlite3
 from pathlib import Path
 
+from dataclasses import dataclass, field
+
 
 TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
 STOPWORDS = {
@@ -12,6 +14,85 @@ STOPWORDS = {
     "i", "in", "is", "it", "me", "my", "of", "on", "or", "please", "some",
     "that", "the", "this", "to", "want", "with", "would", "you", "looking",
 }
+
+QUESTION_ORDER = (
+    "material",
+    "feature",
+    "other",
+    "style",
+    "color",
+    "size",
+    "use_case",
+    "brand",
+    "budget",
+)
+
+BUYING_QUESTION_ORDER = (
+    "other",
+    "material",
+    "feature",
+    "color",
+    "style",
+    "size",
+    "use_case",
+    "brand",
+    "budget",
+)
+
+BROWSING_QUESTION_ORDER = (
+    "feature",
+    "other",
+    "material",
+    "style",
+    "color",
+    "size",
+    "use_case",
+    "brand",
+    "budget",
+)
+
+@dataclass
+class SessionState:
+    user_profile: dict = field(default_factory=dict)
+
+    history: list[str] = field(default_factory=list)
+    constraints: list[str] = field(default_factory=list)
+    attributes: dict[str, str] = field(default_factory=dict)
+
+    profile_terms: list[str] = field(default_factory=list)
+    category_text: str = ""
+    active_constraints: list[str] = field(default_factory=list)
+
+    asked_attributes: set[str] = field(default_factory=set)
+    unavailable_attributes: set[str] = field(default_factory=set)
+
+    mode: str = ""
+    override_seen: bool = False
+
+    def add_constraint(self, value: str) -> None:
+        value = value.strip()
+
+        if value and value.lower() not in {
+            item.lower()
+            for item in self.active_constraints
+        }:
+            self.active_constraints.append(value)
+
+@dataclass
+class ProductDoc:
+    parent_asin: str
+    title: str
+    categories: str
+    features: str
+    details: str
+    store: str
+    description: str
+
+    all_text: str
+
+    terms: set[str]
+    title_terms: set[str]
+    category_terms: set[str]
 
 def _text(value: object) -> str:
     if value is None:
@@ -106,13 +187,16 @@ def _clean_vocab(values: list[str]) -> list[str]:
         key=lambda x: (-len(x.split()), -len(x))
     )
 
+
+
 class Agent:
     """Editable weak baseline: stateless BM25 retrieval with no LLM dependency."""
 
     def __init__(self, catalog_path: str | Path = "data/catalog.jsonl") -> None:
         self.catalog_path = Path(catalog_path)
         self.connection = sqlite3.connect(":memory:")
-        self._sessions: dict[str, dict] = {}
+        self._sessions: dict[str, SessionState] = {}
+        self._products: dict[str, ProductDoc] = {}
         self.sessions = {}
         with open("data/colors.json", encoding="utf-8") as f:
             self.colors = _clean_vocab(json.load(f))
@@ -120,6 +204,73 @@ class Agent:
         with open("data/materials.json", encoding="utf-8") as f:
             self.materials = _clean_vocab(json.load(f))
         self._build_index()
+
+    def _next_question(
+    self,
+    state: SessionState,
+    turn: int,
+    recommendations: list[dict],
+    ) -> str | None:
+
+        if turn >= 9:
+            return None
+
+        if state.mode == "buying":
+            order = BUYING_QUESTION_ORDER
+
+        elif state.mode == "browsing":
+            order = BROWSING_QUESTION_ORDER
+
+        else:
+            order = QUESTION_ORDER
+
+        for attribute in order:
+            if (
+                attribute not in state.asked_attributes
+                and attribute not in state.unavailable_attributes
+            ):
+                state.asked_attributes.add(attribute)
+                return attribute
+
+        return None
+
+    def _message_for(
+        self,
+        ask_attribute: str | None,
+        has_recommendations: bool,
+    ) -> str:
+
+        if ask_attribute == "material":
+            return "I found a few candidates. Is there a material you care about?"
+
+        if ask_attribute == "feature":
+            return "Which product feature should I prioritize next?"
+
+        if ask_attribute == "color":
+            return "Do you have a color preference?"
+
+        if ask_attribute == "style":
+            return "What style or fit should I optimize for?"
+
+        if ask_attribute == "size":
+            return "Is there a size or sizing detail I should account for?"
+
+        if ask_attribute == "use_case":
+            return "What will you mainly use it for?"
+
+        if ask_attribute == "brand":
+            return "Is there a brand you prefer?"
+
+        if ask_attribute == "budget":
+            return "Do you have a budget range?"
+
+        if ask_attribute == "other":
+            return "Is there one more detail that would make the choice right?"
+
+        if has_recommendations:
+            return "Here are the strongest matches from the catalog."
+
+        return "I need one more preference to narrow this down."
 
     def _extract_attributes(self, message: str) -> dict:
         text = _normalize(message)
@@ -156,27 +307,66 @@ class Agent:
         with self.catalog_path.open(encoding="utf-8") as handle:
             for line in handle:
                 product = json.loads(line)
-                batch.append(
-                    (
-                        str(product["parent_asin"]),
-                        _text(product.get("title")),
-                        _text(product.get("categories")),
-                        _text(product.get("features")),
-                        _text(product.get("details")),
-                        _text(product.get("store")),
-                        _text(product.get("description")),
+
+                parent_asin = str(product["parent_asin"])
+
+                title = _text(product.get("title"))
+                categories = _text(product.get("categories"))
+                features = _text(product.get("features"))
+                details = _text(product.get("details"))
+                store = _text(product.get("store"))
+                description = _text(product.get("description"))
+
+                all_text = _normalize(
+                    " ".join(
+                        (
+                            title,
+                            categories,
+                            features,
+                            details,
+                            store,
+                            description,
+                        )
                     )
                 )
-                if len(batch) >= 1000:
-                    cursor.executemany("INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
-                    batch.clear()
+
+                terms = set(_terms(all_text))
+                title_terms = set(_terms(title))
+                category_terms = set(_terms(categories))
+
+                self._products[parent_asin] = ProductDoc(
+                    parent_asin=parent_asin,
+                    title=title,
+                    categories=categories,
+                    features=features,
+                    details=details,
+                    store=store,
+                    description=description,
+                    all_text=all_text,
+                    terms=terms,
+                    title_terms=title_terms,
+                    category_terms=category_terms,
+                )
+
+                batch.append(
+                    (
+                        parent_asin,
+                        title,
+                        categories,
+                        features,
+                        details,
+                        store,
+                        description,
+                    )
+                )
         if batch:
             cursor.executemany("INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
         self.connection.commit()
 
     def reset(self, session_id: str, user_profile: dict) -> None:
         # The profile is anonymized and may be used for personalization.
-        self._sessions[session_id] = {"user_profile": user_profile, "history": [], "constraints": [], "attributes": {}, "mode": ""}
+       self._sessions[session_id] = SessionState(user_profile=user_profile)
+
 
     def respond(
         self,
@@ -195,10 +385,10 @@ class Agent:
 
         #dual-track thing 
         if "key requirement is" in lowered:
-            state["mode"] = "buying"
+            state.mode = "buying"
 
         elif "still exploring" in lowered:
-            state["mode"] = "browsing"
+            state.mode = "browsing"
 
         override_message = _is_override(user_message)
 
@@ -206,10 +396,10 @@ class Agent:
 
         if override_message:
             # User explicitly said to ignore the earlier preference
-            state["attributes"].clear()
+            state.attributes.clear()
 
         for attribute, value in new_attributes.items():
-            state["attributes"][attribute] = value
+            state.attributes[attribute] = value
 
         retry_message = (
             "those options are not quite right yet"
@@ -219,22 +409,22 @@ class Agent:
         new_constraints = []
 
         if not retry_message:
-            state["history"].append(user_message)
+            state.history.append(user_message)
 
             new_constraints = _extract_constraints(user_message)
 
             if override_message and new_constraints:
-                state["constraints"] = new_constraints.copy()
+                state.constraints = new_constraints.copy()
 
             else:
                 for constraint in new_constraints:
-                    if constraint not in state["constraints"]:
-                        state["constraints"].append(constraint)
+                    if constraint not in state.constraints:
+                        state.constraints.append(constraint)
 
-        profile = state["user_profile"]
+        profile = state.user_profile
         preferences = profile.get("preference_tags", [])
 
-        query = " ".join(state["history"])
+        query = " ".join(state.history)
 
         query_terms = _terms(query)
 
@@ -274,55 +464,49 @@ class Agent:
 
             normalized_constraints = [
                 _normalize(constraint)
-                for constraint in state["constraints"]
+                for constraint in state.constraints
             ]
 
             scored_rows = []
 
             for row in rows:
+
                 bm25_score = float(row[7])
 
-                product_text = _normalize(
-                    " ".join(
-                        str(value or "")
-                        for value in row[1:7]
-                    )
-                )
-
-                product_terms = set(_terms(product_text))
-
-                #checking constraint overlap 
+                parent_asin = str(row[0])
+                product = self._products[parent_asin]
 
                 constraint_overlap_score = 0.0
 
                 for constraint in normalized_constraints:
-                    constraint_terms = set(_terms(constraint))
+
+                    constraint_terms = set(
+                        _terms(constraint)
+                    )
 
                     if not constraint_terms:
                         continue
 
                     overlap = len(
-                        constraint_terms & product_terms
+                        constraint_terms & product.terms
                     ) / len(constraint_terms)
 
                     constraint_overlap_score += overlap
-                #finding overlaps 
-
-                title_text = _normalize(str(row[1] or ""))
-                category_text = _normalize(str(row[2] or ""))
 
                 query_term_set = set(query_terms)
 
-                title_terms = set(_terms(title_text))
-                category_terms = set(_terms(category_text))
+                title_overlap = len(
+                    query_term_set & product.title_terms
+                )
 
-                title_overlap = len(query_term_set & title_terms)
-                category_overlap = len(query_term_set & category_terms)
+                category_overlap = len(
+                    query_term_set & product.category_terms
+                )
 
                 matched_constraints = [
                     constraint
                     for constraint in normalized_constraints
-                    if constraint in product_text
+                    if constraint in product.all_text
                 ]
 
                 coverage = len(matched_constraints)
@@ -334,14 +518,15 @@ class Agent:
 
                 attribute_matches = 0
 
-                for attribute, value in state["attributes"].items():
+                for attribute, value in state.attributes.items():
+
                     normalized_value = _normalize(value)
 
                     if (
                         normalized_value
                         and _contains_term(
-                            product_text,
-                            normalized_value
+                            product.all_text,
+                            normalized_value,
                         )
                     ):
                         attribute_matches += 1
@@ -355,7 +540,7 @@ class Agent:
 
                 #title match + dual track
 
-                if state["mode"] == "buying":
+                if state.mode == "buying":
                     score += 2.5 * title_overlap
                     score += 2.0 * category_overlap
                     #constraint overlap boost
@@ -421,11 +606,15 @@ class Agent:
             "What other requirement matters to you?"
         )
 
+        #ask_attribute = self._next_question(state, turn, recommendations)
         ask_attribute = "other"
         
         return {
             "message": message,
             "ask_attribute": ask_attribute,
             "recommendations": recommendations,
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0},
-        }
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+            },
+}
