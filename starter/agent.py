@@ -293,7 +293,7 @@ class Agent:
         self.connection = sqlite3.connect(":memory:")
         self._sessions: dict[str, SessionState] = {}
         self._products: dict[str, ProductDoc] = {}
-        self._constraint_index: dict[str, list[str]] = defaultdict(set)
+        self._constraint_index: dict[str, set[str]] = defaultdict(set)
         self.sessions = {}
         with open("data/colors.json", encoding="utf-8") as f:
             self.colors = _clean_vocab(json.load(f))
@@ -503,7 +503,22 @@ class Agent:
 
         candidate_sets = []
 
+        category_terms = [
+            term
+            for term in _terms(state.category_text)
+            if term not in {
+                "clothing",
+                "shoes",
+                "jewelry",
+                "men",
+                "women",
+                "mens",
+                "womens",
+            }
+        ]
+
         for constraint in state.constraints:
+
             key = _normalize_constraint(constraint)
 
             exact = self._constraint_index.get(
@@ -511,16 +526,42 @@ class Agent:
                 set(),
             )
 
-            if exact and len(exact) <= 500:
+            if not exact:
+                continue
+
+            # Narrow broad exact constraints to the
+            # product category before applying the cutoff.
+            if category_terms:
+
+                filtered = {
+                    parent_asin
+                    for parent_asin in exact
+                    if any(
+                        term
+                        in self._products[
+                            parent_asin
+                        ].categories.lower()
+                        for term in category_terms
+                    )
+                }
+
+                if filtered:
+                    exact = filtered
+
+            if len(exact) <= 500:
                 candidate_sets.append(exact)
 
         if not candidate_sets:
             return set()
 
-        candidates = set.intersection(*candidate_sets)
+        candidates = set.intersection(
+            *candidate_sets
+        )
 
         if not candidates:
-            candidates = set.union(*candidate_sets)
+            candidates = set.union(
+                *candidate_sets
+            )
 
         return candidates
 
@@ -578,6 +619,15 @@ class Agent:
         state = self._sessions[session_id]
 
         lowered = user_message.lower()
+
+        looking_match = re.search(
+            r"looking for (.*?)(?:\.|, but|$)",
+            user_message,
+            re.I,
+        )
+
+        if looking_match:
+            state.category_text = looking_match.group(1).strip()
 
         #dual-track thing 
         if "key requirement is" in lowered:

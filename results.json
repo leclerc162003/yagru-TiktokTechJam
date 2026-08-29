@@ -1,10 +1,10 @@
 {
   "sample_count": 200,
   "hit_rate_at_10": 0.975,
-  "mrr": 0.674413,
+  "mrr": 0.674579,
   "mttc": 2.435,
   "efficiency": 0.8565,
-  "recommended_technical_score": 0.861124,
+  "recommended_technical_score": 0.861174,
   "reported_token_usage": {
     "prompt_tokens": 0,
     "completion_tokens": 0,
@@ -20,7 +20,7 @@
     "browsing": {
       "sample_count": 80,
       "hit_rate_at_10": 0.975,
-      "mrr": 0.681528,
+      "mrr": 0.681944,
       "mttc": 2.35
     },
     "buying": {
@@ -82,8 +82,8 @@
       "scenario_type": "browsing",
       "hit": true,
       "first_hit_turn": 2,
-      "best_rank": 6,
-      "reciprocal_rank": 0.16666666666666666
+      "best_rank": 5,
+      "reciprocal_rank": 0.2
     },
     {
       "sample_id": "public_0007",
