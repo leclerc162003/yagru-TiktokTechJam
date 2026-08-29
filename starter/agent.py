@@ -128,6 +128,10 @@ TURN_ONE_RELEASE_MIN_MARGIN = 10.0
 TURN_TWO_GATE_MIN_POOL = 16
 TURN_TWO_GATE_MAX_MARGIN = 6.0
 TURN_TWO_GATE_MIN_RAW_RANK = 6
+FINAL_RESCUE_TURN = 10
+FINAL_RESCUE_WINDOW = 50
+FINAL_RESCUE_RAW_SCORE_GAP = 4.0
+FINAL_RESCUE_RATING_RATIO = 5.0
 
 
 @dataclass
@@ -856,6 +860,58 @@ class Agent:
             )
         )
 
+    def _apply_final_turn_rescue(
+        self,
+        state: SessionState,
+        recommendations: list[dict],
+        top_k: int,
+    ) -> list[dict]:
+        """Safely widen ranking only after the normal session has missed."""
+        if len(recommendations) <= top_k:
+            return recommendations[:top_k]
+
+        signature_candidates = self._signature_candidates(state)
+        if 0 < len(signature_candidates) <= MAX_SIGNATURE_POOL:
+            return recommendations[:top_k]
+
+        raw_order = sorted(
+            recommendations,
+            key=lambda item: (
+                -float(item.get("score", 0.0)),
+                item["parent_asin"],
+            ),
+        )
+        raw_head = raw_order[:top_k]
+        if len(raw_head) < top_k:
+            return recommendations[:top_k]
+
+        head_max_count = max(
+            self._rating_count.get(item["parent_asin"], 0.0)
+            for item in raw_head
+        )
+        raw_cutoff = (
+            float(raw_head[-1].get("score", 0.0))
+            - FINAL_RESCUE_RAW_SCORE_GAP
+        )
+        eligible = list(raw_head)
+        eligible.extend(
+            item
+            for item in raw_order[top_k:]
+            if (
+                item["parent_asin"] in signature_candidates
+                and float(item.get("score", 0.0)) >= raw_cutoff
+                and self._rating_count.get(item["parent_asin"], 0.0)
+                >= FINAL_RESCUE_RATING_RATIO * max(1.0, head_max_count)
+            )
+        )
+        return sorted(
+            eligible,
+            key=lambda item: (
+                -self._popularity_adjusted_score(item),
+                item["parent_asin"],
+            ),
+        )[:top_k]
+
     def _predicted_turn_one_margin(
         self,
         recommendations: list[dict],
@@ -1145,6 +1201,12 @@ class Agent:
 
         state = self._sessions[session_id]
         self._reduce_state(state, user_message, turn)
+        response_top_k = top_k
+        ranking_top_k = (
+            FINAL_RESCUE_WINDOW
+            if turn == FINAL_RESCUE_TURN
+            else top_k
+        )
 
         profile = state.user_profile
         preferences = profile.get("preference_tags", [])
@@ -1175,7 +1237,7 @@ class Agent:
         if not expression:
             recommendations: list[dict] = []
         else:
-            candidate_k = max(100, top_k * 10)
+            candidate_k = max(100, ranking_top_k * 10)
 
             rows = self.connection.execute(
                 "SELECT parent_asin, "
@@ -1334,7 +1396,7 @@ class Agent:
                     "parent_asin": item[1],
                     "score": round(item[0], 6),
                 }
-                for item in scored_rows[:top_k]
+                for item in scored_rows[:ranking_top_k]
             ]
 
         ask_attribute = "other"
@@ -1359,7 +1421,7 @@ class Agent:
         recommendations, signature_pool_size = self._promote_signature_pool(
             state,
             recommendations,
-            top_k,
+            ranking_top_k,
         )
         recommendations = self._rerank_with_popularity_prior(
             state,
@@ -1380,6 +1442,15 @@ class Agent:
                 "I found a focused set matching your category and requirements. "
                 f"{QUESTION_MESSAGES[ask_attribute]}"
             )
+
+        if turn == FINAL_RESCUE_TURN:
+            recommendations = self._apply_final_turn_rescue(
+                state,
+                recommendations,
+                response_top_k,
+            )
+        else:
+            recommendations = recommendations[:response_top_k]
 
         return {
             "message": message,
