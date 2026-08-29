@@ -123,6 +123,9 @@ CONFIDENCE_GATE_MIN_CONSTRAINTS = 2
 SINGLE_VALUE_ATTRIBUTES = frozenset({"material", "color", "size", "brand", "budget"})
 MAX_SIGNATURE_POOL = 10
 POPULARITY_PRIOR_WEIGHT = 6.0
+TURN_TWO_GATE_MIN_POOL = 16
+TURN_TWO_GATE_MAX_MARGIN = 6.0
+TURN_TWO_GATE_MIN_RAW_RANK = 6
 
 
 @dataclass
@@ -816,18 +819,60 @@ class Agent:
         return sorted(
             recommendations,
             key=lambda item: (
-                -(
-                    float(item.get("score", 0.0))
-                    + POPULARITY_PRIOR_WEIGHT
-                    * math.log1p(
-                        max(
-                            0.0,
-                            self._rating_count.get(item["parent_asin"], 0.0),
-                        )
-                    )
-                ),
+                -self._popularity_adjusted_score(item),
                 item["parent_asin"],
             ),
+        )
+
+    def _popularity_adjusted_score(self, item: dict) -> float:
+        return (
+            float(item.get("score", 0.0))
+            + POPULARITY_PRIOR_WEIGHT
+            * math.log1p(
+                max(
+                    0.0,
+                    self._rating_count.get(item["parent_asin"], 0.0),
+                )
+            )
+        )
+
+    def _should_withhold_ambiguous_turn_two(
+        self,
+        state: SessionState,
+        turn: int,
+        recommendations: list[dict],
+    ) -> bool:
+        if (
+            turn != 2
+            or state.mode != "browsing"
+            or len(state.constraints) > 2
+            or len(recommendations) < 2
+        ):
+            return False
+
+        if len(self._signature_candidates(state)) < TURN_TWO_GATE_MIN_POOL:
+            return False
+
+        adjusted_margin = (
+            self._popularity_adjusted_score(recommendations[0])
+            - self._popularity_adjusted_score(recommendations[1])
+        )
+        raw_relevance_order = sorted(
+            recommendations,
+            key=lambda item: (
+                -float(item.get("score", 0.0)),
+                item["parent_asin"],
+            ),
+        )
+        top_parent_asin = recommendations[0]["parent_asin"]
+        top_raw_rank = next(
+            position
+            for position, item in enumerate(raw_relevance_order, start=1)
+            if item["parent_asin"] == top_parent_asin
+        )
+        return (
+            adjusted_margin <= TURN_TWO_GATE_MAX_MARGIN
+            or top_raw_rank >= TURN_TWO_GATE_MIN_RAW_RANK
         )
 
     def _build_index(self) -> None:
@@ -1288,6 +1333,16 @@ class Agent:
             state,
             recommendations,
         )
+        if self._should_withhold_ambiguous_turn_two(
+            state,
+            turn,
+            recommendations,
+        ):
+            recommendations = []
+            message = (
+                "The leading matches are still close. "
+                f"{QUESTION_MESSAGES[ask_attribute]}"
+            )
         if signature_pool_size:
             message = (
                 "I found a focused set matching your category and requirements. "
