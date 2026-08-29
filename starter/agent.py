@@ -349,8 +349,10 @@ def _is_override(message: str) -> bool:
     return any(marker in text for marker in override_markers)
 
 def _contains_term(text: str, term: str) -> bool:
-    pattern = rf"\b{re.escape(term)}\b"
-    return re.search(pattern, text, re.I) is not None
+    # Callers pass normalized alphanumeric text. Padding both values preserves
+    # whole-token and whole-phrase boundaries without compiling a regex for
+    # every vocabulary candidate.
+    return bool(term) and f" {term.lower()} " in f" {text.lower()} "
 
 def _clean_vocab(values: list[str]) -> list[str]:
     cleaned = set()
@@ -506,6 +508,7 @@ class Agent:
         self._constraint_index: dict[str, set[str]] = defaultdict(set)
         self._signature_value_index: dict[str, set[str]] = defaultdict(set)
         self._signature_category_index: dict[str, set[str]] = defaultdict(set)
+        self._attribute_parse_cache: dict[str, dict[str, str]] = {}
         self.sessions = {}
         with open("data/colors.json", encoding="utf-8") as f:
             self.colors = _clean_vocab(json.load(f))
@@ -583,6 +586,11 @@ class Agent:
 
     def _extract_attributes(self, message: str) -> dict:
         text = _normalize(message)
+        cached = self._attribute_parse_cache.get(text)
+
+        if cached is not None:
+            return cached.copy()
+
         attributes = {}
 
         found_colors = [
@@ -603,6 +611,7 @@ class Agent:
         if found_materials:
             attributes["material"] = found_materials[0]
 
+        self._attribute_parse_cache[text] = attributes.copy()
         return attributes
 
     def _constraint_attribute(self, value: str) -> str:
