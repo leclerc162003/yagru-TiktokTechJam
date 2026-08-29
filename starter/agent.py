@@ -508,6 +508,7 @@ class Agent:
         self._constraint_index: dict[str, set[str]] = defaultdict(set)
         self._signature_value_index: dict[str, set[str]] = defaultdict(set)
         self._signature_category_index: dict[str, set[str]] = defaultdict(set)
+        self._rating_count: dict[str, float] = {}
         self._attribute_parse_cache: dict[str, dict[str, str]] = {}
         self.sessions = {}
         with open("data/colors.json", encoding="utf-8") as f:
@@ -764,7 +765,8 @@ class Agent:
         }
         query_terms = set(_terms(state.search_text()))
 
-        def candidate_key(parent_asin: str) -> tuple[float, int, str]:
+        def candidate_key(parent_asin: str) -> tuple[float, float, int, str]:
+            rating_count = self._rating_count.get(parent_asin, 0.0)
             existing_score = float(
                 existing.get(parent_asin, {}).get("score", -1e9)
             )
@@ -773,7 +775,7 @@ class Agent:
                 query_terms
                 & (product.title_terms | product.category_terms)
             )
-            return (-existing_score, -overlap, parent_asin)
+            return (-rating_count, -existing_score, -overlap, parent_asin)
 
         promoted = [
             {
@@ -811,6 +813,9 @@ class Agent:
                 intent_values = _intent_values(product)
 
                 parent_asin = str(product["parent_asin"])
+                self._rating_count[parent_asin] = float(
+                    product.get("rating_number") or 0.0
+                )
 
                 for value in _product_signature_values(product):
                     normalized_value = _normalize_constraint(value)
