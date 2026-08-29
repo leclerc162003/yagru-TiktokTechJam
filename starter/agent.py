@@ -51,6 +51,45 @@ BROWSING_QUESTION_ORDER = (
     "budget",
 )
 
+FAMILY_RELATED_TERMS = {
+    "walking": {
+        "walking": 2.0,
+        "walk": 1.0,
+        "sneaker": 1.2,
+        "shoe": 1.0,
+        "comfort": 0.8,
+        "slip": 0.6,
+    },
+
+    "boots": {
+        "boot": 2.0,
+        "leather": 1.0,
+        "rubber": 0.7,
+        "sole": 0.7,
+    },
+
+    "jackets": {
+        "jacket": 2.0,
+        "coat": 1.2,
+        "outerwear": 1.0,
+        "winter": 1.0,
+    },
+
+    "hoodies": {
+        "hoodie": 2.0,
+        "hooded": 1.0,
+        "pullover": 1.0,
+        "sweatshirt": 1.0,
+    },
+
+    "jeans": {
+        "jean": 2.0,
+        "denim": 1.5,
+    },
+}
+
+SEMANTIC_FAMILY_WEIGHT = 0.25
+
 @dataclass
 class SessionState:
     user_profile: dict = field(default_factory=dict)
@@ -93,6 +132,9 @@ class ProductDoc:
     terms: set[str]
     title_terms: set[str]
     category_terms: set[str]
+
+    semantic_title_terms: set[str]
+    semantic_catalog_terms: set[str]
 
     intent_values: set[str]
 
@@ -228,6 +270,18 @@ def _intent_values(product: dict) -> set[str]:
             values.add(normalized)
 
     return values
+
+def _stem_token(token: str) -> str:
+    if len(token) > 4 and token.endswith("ies"):
+        return f"{token[:-3]}y"
+
+    if len(token) > 4 and token.endswith("es"):
+        return token[:-2]
+
+    if len(token) > 3 and token.endswith("s"):
+        return token[:-1]
+
+    return token
 
 
 
@@ -379,6 +433,24 @@ class Agent:
                 title_terms = set(_terms(title))
                 category_terms = set(_terms(categories))
 
+                semantic_title_terms = {
+                    _stem_token(term)
+                    for term in title_terms
+                }
+
+                semantic_catalog_terms = {
+                    _stem_token(term)
+                    for term in _terms(
+                        " ".join(
+                            (
+                                title,
+                                categories,
+                                features,
+                            )
+                        )
+                    )
+                }
+
                 self._products[parent_asin] = ProductDoc(
                     parent_asin=parent_asin,
                     title=title,
@@ -391,6 +463,9 @@ class Agent:
                     terms=terms,
                     title_terms=title_terms,
                     category_terms=category_terms,
+                    semantic_title_terms=semantic_title_terms,
+                    semantic_catalog_terms=semantic_catalog_terms,
+
                     intent_values=intent_values
                 )
 
@@ -448,6 +523,45 @@ class Agent:
             candidates = set.union(*candidate_sets)
 
         return candidates
+
+    def _semantic_family_score(
+        self,
+        product: ProductDoc,
+        query_terms: list[str],
+    ) -> float:
+
+        score = 0.0
+
+    
+
+        for term in query_terms:
+
+            stem = _stem_token(term)
+
+            # Exact stem in title
+            if stem in product.semantic_title_terms:
+                score += 2.0
+
+            # Exact stem elsewhere in catalog fields
+            elif stem in product.semantic_catalog_terms:
+                score += 0.8
+
+            related_terms = FAMILY_RELATED_TERMS.get(
+                term,
+                FAMILY_RELATED_TERMS.get(stem, {}),
+            )
+
+            for related, weight in related_terms.items():
+
+                related_stem = _stem_token(related)
+
+                if related_stem in product.semantic_title_terms:
+                    score += weight
+
+                elif related_stem in product.semantic_catalog_terms:
+                    score += 0.35 * weight
+
+        return score
 
 
     def respond(
@@ -562,9 +676,31 @@ class Agent:
                 for constraint in state.constraints
             ]
 
-            scored_rows = []
+            constraint_term_sets = [
+                (
+                    constraint,
+                    set(_terms(constraint)),
+                )
+                for constraint in normalized_constraints
+            ]
+
+            normalized_exact_constraints = [
+                _normalize_constraint(constraint)
+                for constraint in state.constraints
+            ]
+
+            normalized_attributes = [
+                _normalize(value)
+                for value in state.attributes.values()
+            ]
+
+            semantic_query_terms = _terms(
+                " ".join(state.history)
+            )
 
             query_term_set = set(query_terms)
+
+            scored_rows = []
 
 
             for parent_asin, bm25_score in candidate_scores.items():
@@ -573,11 +709,7 @@ class Agent:
 
                 constraint_overlap_score = 0.0
 
-                for constraint in normalized_constraints:
-
-                    constraint_terms = set(
-                        _terms(constraint)
-                    )
+                for constraint, constraint_terms in constraint_term_sets:
 
                     if not constraint_terms:
                         continue
@@ -613,9 +745,7 @@ class Agent:
 
                 attribute_matches = 0
 
-                for attribute, value in state.attributes.items():
-
-                    normalized_value = _normalize(value)
+                for normalized_value in normalized_attributes:
 
                     if (
                         normalized_value
@@ -628,13 +758,10 @@ class Agent:
 
                 exact_constraint_matches = 0
 
-                for constraint in state.constraints:
-                    normalized_constraint = _normalize_constraint(
-                        constraint
-                    )
-
+                for normalized_constraint in normalized_exact_constraints:
                     if normalized_constraint in product.intent_values:
                         exact_constraint_matches += 1
+
 
                 score = -bm25_score
 
@@ -643,6 +770,14 @@ class Agent:
                 score += 1.5 * specificity
 
                 score += 8.0 * exact_constraint_matches
+
+                score += (
+                SEMANTIC_FAMILY_WEIGHT
+                * self._semantic_family_score(
+                    product,
+                    semantic_query_terms,
+                )
+            )
 
                 if state.mode == "buying":
                     score += 2.5 * title_overlap
