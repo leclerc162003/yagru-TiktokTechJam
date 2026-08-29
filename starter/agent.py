@@ -123,6 +123,7 @@ CONFIDENCE_GATE_MIN_CONSTRAINTS = 2
 SINGLE_VALUE_ATTRIBUTES = frozenset({"material", "color", "size", "brand", "budget"})
 MAX_SIGNATURE_POOL = 10
 POPULARITY_PRIOR_WEIGHT = 6.0
+TURN_ONE_RELEASE_MIN_MARGIN = 10.0
 TURN_TWO_GATE_MIN_POOL = 16
 TURN_TWO_GATE_MAX_MARGIN = 6.0
 TURN_TWO_GATE_MIN_RAW_RANK = 6
@@ -729,7 +730,20 @@ class Agent:
         if not recommendations or turn > CONFIDENCE_GATE_MAX_TURN:
             return False
 
-        return len(state.constraints) < CONFIDENCE_GATE_MIN_CONSTRAINTS
+        insufficient_constraints = (
+            len(state.constraints) < CONFIDENCE_GATE_MIN_CONSTRAINTS
+        )
+        if not insufficient_constraints:
+            return False
+
+        if (
+            state.mode == "buying"
+            and self._predicted_turn_one_margin(recommendations, state)
+            >= TURN_ONE_RELEASE_MIN_MARGIN
+        ):
+            return False
+
+        return True
 
     def _signature_candidates(self, state: SessionState) -> set[str]:
         category_candidates = self._signature_category_index.get(
@@ -834,6 +848,24 @@ class Agent:
                     self._rating_count.get(item["parent_asin"], 0.0),
                 )
             )
+        )
+
+    def _predicted_turn_one_margin(
+        self,
+        recommendations: list[dict],
+        state: SessionState,
+    ) -> float:
+        promoted, _ = self._promote_signature_pool(
+            state,
+            recommendations,
+            len(recommendations),
+        )
+        ranked = self._rerank_with_popularity_prior(state, promoted)
+        if len(ranked) < 2:
+            return float("inf") if ranked else 0.0
+        return (
+            self._popularity_adjusted_score(ranked[0])
+            - self._popularity_adjusted_score(ranked[1])
         )
 
     def _should_withhold_ambiguous_turn_two(
