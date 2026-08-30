@@ -1181,10 +1181,29 @@ class Agent:
 
         self.memory_connection.commit()
 
+    def _memory_key(
+    self,
+    session_id: str,
+    user_profile: dict,
+) -> str:
+
+        # Real deployment: use an actual stable user identifier.
+        for field in ("user_id", "profile_id", "customer_id"):
+            value = user_profile.get(field)
+
+            if value:
+                return hashlib.sha256(
+                    str(value).encode("utf-8")
+                ).hexdigest()[:16]
+
+        # Anonymous evaluator/user:
+        # do NOT share memory with another session.
+        return f"session:{session_id}"
+
     def reset(self, session_id: str, user_profile: dict) -> None:
         # The profile is anonymized and may be used for personalization.
     #    self._sessions[session_id] = SessionState(user_profile=user_profile)
-            profile_key = self._profile_key(user_profile)
+            profile_key = self._memory_key(session_id, user_profile,)
 
             self._sessions[session_id] = SessionState(
                 user_profile=user_profile,
@@ -1375,6 +1394,82 @@ class Agent:
             for row in rows
         ]
 
+    def _memory_preferred_attribute(
+    self,
+    state: SessionState,
+) -> str | None:
+
+        rows = self.memory_connection.execute(
+            """
+            SELECT preference, score
+            FROM learned_preferences
+            WHERE profile_key = ?
+            AND score >= 2.0
+            ORDER BY score DESC, updated_at DESC
+            LIMIT 10
+            """,
+            (state.profile_key,),
+        ).fetchall()
+
+        for preference, score in rows:
+            attribute = self._constraint_attribute(
+                str(preference)
+            )
+
+            if attribute not in {
+                "material",
+                "color",
+                "style",
+                "size",
+                "use_case",
+                "brand",
+                "budget",
+                "feature",
+            }:
+                continue
+
+            if attribute in state.asked_attributes:
+                continue
+
+            if attribute in state.unavailable_attributes:
+                continue
+
+            return attribute
+        return None
+
+    def _adaptive_question(
+    self,
+    state: SessionState,
+    turn: int,
+    recommendations: list[dict],
+) -> str | None:
+
+        # Only use long-term memory for vague browsing.
+        if (
+            state.mode == "browsing"
+            and not state.constraints
+            and turn <= 2
+        ):
+            memory_attribute = self._memory_preferred_attribute(
+                state
+            )
+
+            if memory_attribute is not None:
+                state.asked_attributes.add(
+                    memory_attribute
+                )
+
+                return memory_attribute
+
+        # Preserve existing behaviour otherwise.
+        return self._next_question(
+            state,
+            turn,
+            recommendations,
+        )
+    
+    
+
     def respond(
         self,
         session_id: str,
@@ -1397,6 +1492,8 @@ class Agent:
         profile = state.user_profile
         preferences = profile.get("preference_tags", [])
 
+        learned_preferences = self._load_learned_preferences(state.profile_key,limit=5,)
+
         query = state.search_text()
         retrieval_query = state.retrieval_text()
 
@@ -1417,6 +1514,9 @@ class Agent:
         # been supplied; explicit session evidence always wins.
         if not state.constraints and len(all_terms) < 8:
             all_terms.extend(preference_terms)
+            if state.mode == "browsing" and len(all_terms) < 8:
+                for preference in learned_preferences:
+                    all_terms.extend(_terms(preference))
 
         unique_terms = list(dict.fromkeys(all_terms))[:40]
         expression = " OR ".join(f'"{term}"' for term in unique_terms)
@@ -1580,7 +1680,7 @@ class Agent:
             recommendations = [
                 {
                     "parent_asin": item[1],
-                    "score": round(item[0], 6),
+                    "score": round(item[0], 6)
                 }
                 for item in scored_rows[:ranking_top_k]
             ]
