@@ -566,6 +566,19 @@ class Agent:
 
         cursor.execute(
             """
+            CREATE TABLE IF NOT EXISTS learned_preferences (
+                profile_key TEXT NOT NULL,
+                preference TEXT NOT NULL,
+                score REAL NOT NULL DEFAULT 0,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+
+                PRIMARY KEY (profile_key, preference)
+            )
+            """
+        )
+
+        cursor.execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_interactions_profile
             ON interactions(profile_key)
             """
@@ -1286,6 +1299,81 @@ class Agent:
 
         return score
 
+    def _is_learnable_preference(self, value: str) -> bool:
+        terms = _terms(value)
+
+        if not terms:
+            return False
+
+        # Avoid entire product descriptions/specifications.
+        if len(terms) > 6:
+            return False
+
+        return True
+
+    def _update_learned_preferences(
+    self,
+    state: SessionState,
+    turn: int, ) -> None:
+
+        preferences = set()
+
+        # Learn only constraints introduced on THIS turn.
+        for record in state.constraint_records:
+            if record.active and record.source_turn == turn:
+                normalized = _normalize_constraint(record.value)
+
+                if (normalized and self._is_learnable_preference(normalized)):
+                    preferences.add(normalized)
+
+        for preference in preferences:
+            self.memory_connection.execute(
+                """
+                INSERT INTO learned_preferences (
+                    profile_key,
+                    preference,
+                    score
+                )
+                VALUES (?, ?, 1.0)
+
+                ON CONFLICT(profile_key, preference)
+                DO UPDATE SET
+                    score = score + 1.0,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    state.profile_key,
+                    preference,
+                ),
+            )
+
+        self.memory_connection.commit()
+
+
+    def _load_learned_preferences(
+        self,
+        profile_key: str,
+        limit: int = 10,
+    ) -> list[str]:
+
+        rows = self.memory_connection.execute(
+            """
+            SELECT preference, score
+            FROM learned_preferences
+            WHERE profile_key = ?
+            ORDER BY score DESC, updated_at DESC
+            LIMIT ?
+            """,
+            (
+                profile_key,
+                limit,
+            ),
+        ).fetchall()
+
+        return [
+            str(row[0])
+            for row in rows
+        ]
 
     def respond(
         self,
@@ -1550,12 +1638,24 @@ class Agent:
         else:
             recommendations = recommendations[:response_top_k]
 
-        self._log_interaction(
-            session_id=session_id,
-            turn=turn,
-            user_message=user_message,
-            state=state,
-            recommendations=recommendations,
+        try:
+            self._log_interaction(
+                session_id=session_id,
+                turn=turn,
+                user_message=user_message,
+                state=state,
+                recommendations=recommendations,
+            )
+
+            self._update_learned_preferences(
+                state,
+                turn,
+            )
+
+        except (sqlite3.Error, TypeError, ValueError) as exc:
+            print(
+                f"Memory update failed: {exc}",
+                file=sys.stderr,
             )
 
         return {
