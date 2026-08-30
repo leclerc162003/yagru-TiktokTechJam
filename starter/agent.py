@@ -568,11 +568,16 @@ class Agent:
             """
             CREATE TABLE IF NOT EXISTS learned_preferences (
                 profile_key TEXT NOT NULL,
-                preference TEXT NOT NULL,
+                preference_type TEXT NOT NULL,
+                preference_value TEXT NOT NULL,
                 score REAL NOT NULL DEFAULT 0,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 
-                PRIMARY KEY (profile_key, preference)
+                PRIMARY KEY (
+                    profile_key,
+                    preference_type,
+                    preference_value
+                )
             )
             """
         )
@@ -1337,47 +1342,124 @@ class Agent:
 
         preferences = set()
 
-        # Learn only constraints introduced on THIS turn.
         for record in state.constraint_records:
-            if record.active and record.source_turn == turn:
-                normalized = _normalize_constraint(record.value)
 
-                if (normalized and self._is_learnable_preference(normalized)):
-                    preferences.add(normalized)
+            if not (
+                record.active
+                and record.source_turn == turn
+            ):
+                continue
 
-        for preference in preferences:
+            value = self._clean_preference_value(
+                record.attribute,
+                record.value,
+            )
+
+            if not value:
+                continue
+
+            if not self._is_learnable_preference(value):
+                continue
+
+            preferences.add(
+                (
+                    record.attribute,
+                    value,
+                )
+            )
+
+        for preference_type, preference_value in preferences:
+
+            # Weaken competing values of the same preference type.
+            self.memory_connection.execute(
+                """
+                UPDATE learned_preferences
+                SET
+                    score = CASE
+                        WHEN score > 1.0 THEN score - 1.0
+                        ELSE 0
+                    END,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE profile_key = ?
+                AND preference_type = ?
+                AND preference_value != ?
+                """,
+                (
+                    state.profile_key,
+                    preference_type,
+                    preference_value,
+                ),
+            )
+
+            # Remove preferences whose confidence has fallen to zero.
+            self.memory_connection.execute(
+                """
+                DELETE FROM learned_preferences
+                WHERE profile_key = ?
+                AND preference_type = ?
+                AND score <= 0
+                """,
+                (
+                    state.profile_key,
+                    preference_type,
+                ),
+            )
+
             self.memory_connection.execute(
                 """
                 INSERT INTO learned_preferences (
                     profile_key,
-                    preference,
+                    preference_type,
+                    preference_value,
                     score
                 )
-                VALUES (?, ?, 1.0)
+                VALUES (?, ?, ?, 1.0)
 
-                ON CONFLICT(profile_key, preference)
+                ON CONFLICT(
+                    profile_key,
+                    preference_type,
+                    preference_value
+                )
                 DO UPDATE SET
                     score = score + 1.0,
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 (
                     state.profile_key,
-                    preference,
+                    preference_type,
+                    preference_value,
                 ),
             )
 
         self.memory_connection.commit()
+
+    def _clean_preference_value(
+        self,
+        attribute: str,
+        value: str, ) -> str:
+
+        normalized = _normalize_constraint(value)
+
+        prefix = f"{attribute} "
+
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix):]
+
+        return normalized.strip()
 
 
     def _load_learned_preferences(
         self,
         profile_key: str,
         limit: int = 10,
-    ) -> list[str]:
+    ) -> list[dict]:
 
         rows = self.memory_connection.execute(
             """
-            SELECT preference, score
+            SELECT
+                preference_type,
+                preference_value,
+                score
             FROM learned_preferences
             WHERE profile_key = ?
             ORDER BY score DESC, updated_at DESC
@@ -1390,7 +1472,11 @@ class Agent:
         ).fetchall()
 
         return [
-            str(row[0])
+            {
+                "type": str(row[0]),
+                "value": str(row[1]),
+                "score": float(row[2]),
+            }
             for row in rows
         ]
 
