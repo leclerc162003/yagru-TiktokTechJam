@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 from collections import defaultdict
 from dataclasses import dataclass, field
+import hashlib
 
 
 TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
@@ -155,6 +156,7 @@ class PreferenceRecord:
 @dataclass
 class SessionState:
     user_profile: dict = field(default_factory=dict)
+    profile_key: str = ""
 
     history: list[str] = field(default_factory=list)
     constraint_records: list[ConstraintRecord] = field(default_factory=list)
@@ -519,6 +521,9 @@ class Agent:
         self._attribute_parse_cache: dict[str, dict[str, str]] = {}
         self.sessions = {}
         catalog_data_dir = self.catalog_path.resolve().parent
+        self.memory_connection = sqlite3.connect(
+        catalog_data_dir / "agent_memory.sqlite3")
+        self._build_memory_store()
         bundled_data_dir = Path(__file__).resolve().parents[1] / "data"
 
         def resource_path(filename: str) -> Path:
@@ -533,6 +538,40 @@ class Agent:
         with resource_path("materials.json").open(encoding="utf-8") as f:
             self.materials = _clean_vocab(json.load(f))
         self._build_index()
+
+    def _build_memory_store(self) -> None:
+        cursor = self.memory_connection.cursor()
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS interactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                profile_key TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                turn INTEGER NOT NULL,
+
+                user_message TEXT NOT NULL,
+                intent TEXT,
+                category TEXT,
+
+                constraints TEXT,
+                attributes TEXT,
+                recommendations TEXT,
+
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_interactions_profile
+            ON interactions(profile_key)
+            """
+        )
+
+        self.memory_connection.commit()
 
     def _next_question(
     self,
@@ -1076,9 +1115,68 @@ class Agent:
             cursor.executemany("INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
         self.connection.commit()
 
+    def _profile_key(self, user_profile: dict) -> str:
+        serialized = json.dumps(
+            user_profile,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+        return hashlib.sha256(
+            serialized.encode("utf-8")
+        ).hexdigest()[:16]
+
+    def _log_interaction(
+            self,
+            session_id: str,
+            turn: int,
+            user_message: str,
+            state: SessionState,
+            recommendations: list[dict],
+        ) -> None:
+
+        self.memory_connection.execute(
+            """
+            INSERT INTO interactions (
+                profile_key,
+                session_id,
+                turn,
+                user_message,
+                intent,
+                category,
+                constraints,
+                attributes,
+                recommendations
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                state.profile_key,
+                session_id,
+                turn,
+                user_message,
+                state.mode,
+                state.category_text,
+                json.dumps(state.constraints),
+                json.dumps(state.attributes),
+                json.dumps([
+                    item["parent_asin"]
+                    for item in recommendations
+                ]),
+            ),
+        )
+
+        self.memory_connection.commit()
+
     def reset(self, session_id: str, user_profile: dict) -> None:
         # The profile is anonymized and may be used for personalization.
-       self._sessions[session_id] = SessionState(user_profile=user_profile)
+    #    self._sessions[session_id] = SessionState(user_profile=user_profile)
+            profile_key = self._profile_key(user_profile)
+
+            self._sessions[session_id] = SessionState(
+                user_profile=user_profile,
+                profile_key=profile_key,
+            )
 
     def _exact_constraint_candidates(
         self,
@@ -1451,6 +1549,14 @@ class Agent:
             )
         else:
             recommendations = recommendations[:response_top_k]
+
+        self._log_interaction(
+            session_id=session_id,
+            turn=turn,
+            user_message=user_message,
+            state=state,
+            recommendations=recommendations,
+            )
 
         return {
             "message": message,
