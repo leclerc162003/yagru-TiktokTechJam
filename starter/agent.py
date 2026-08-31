@@ -11,6 +11,11 @@ from dataclasses import dataclass, field
 import hashlib
 
 
+# =============================================================================
+# Text parsing and dialogue policy
+# =============================================================================
+
+
 TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
 SIGNATURE_MATERIAL_RE = re.compile(
     r"\b(cotton|polyester|nylon|leather|wool|spandex|silk|rayon|fabric)\b",
@@ -119,6 +124,11 @@ QUESTION_MESSAGES = {
     "budget": "Do you have a budget range?",
 }
 
+
+# =============================================================================
+# Ranking safeguards and runtime feature switches
+# =============================================================================
+
 SEMANTIC_FAMILY_WEIGHT = 0.25
 CONFIDENCE_GATE_MAX_TURN = 1
 CONFIDENCE_GATE_MIN_CONSTRAINTS = 2
@@ -133,12 +143,9 @@ FINAL_RESCUE_TURN = 10
 FINAL_RESCUE_WINDOW = 50
 FINAL_RESCUE_RAW_SCORE_GAP = 4.0
 FINAL_RESCUE_RATING_RATIO = 5.0
-
-# Kill switch for the runtime self-evolution controller.
+# Kill switches provide an immediate fallback to the previous runtime behavior.
 SELF_EVOLUTION_ENABLED = True
 SELF_EVOLUTION_CANDIDATE_WINDOW = 100
-
-# Kill switch for conservative input/state robustness hardening.
 ROBUSTNESS_HARDENING_ENABLED = True
 STRUCTURAL_CUE_WORDS = frozenset({
     "actually",
@@ -177,6 +184,10 @@ def _build_structural_deletion_index() -> dict[str, tuple[str, ...]]:
 
 STRUCTURAL_DELETION_INDEX = _build_structural_deletion_index()
 
+
+# =============================================================================
+# Structured session state
+# =============================================================================
 
 @dataclass
 class ConstraintRecord:
@@ -242,6 +253,7 @@ class SessionState:
 
         if not normalized:
             return
+
         if any(
             record.active and record.normalized == normalized
             for record in self.constraint_records
@@ -323,6 +335,8 @@ class SessionState:
 
 @dataclass(slots=True)
 class ProductDoc:
+    """Precomputed catalog fields used by retrieval and reranking."""
+
     categories: str
     all_text: str
 
@@ -334,6 +348,11 @@ class ProductDoc:
     semantic_catalog_terms: set[str]
 
     intent_values: set[str]
+
+
+# =============================================================================
+# Normalization and catalog-signature helpers
+# =============================================================================
 
 def _text(value: object) -> str:
     if value is None:
@@ -587,7 +606,16 @@ def _stem_token(token: str) -> str:
 
 
 class Agent:
-    """Editable weak baseline: stateless BM25 retrieval with no LLM dependency."""
+    """Competition agent with short-term state and persistent preference memory.
+
+    ``SessionState`` holds the current conversation. A small SQLite database
+    stores learned preference evidence, while a separate in-memory FTS5 index
+    serves catalog retrieval. All ranking and adaptation rules are deterministic.
+    """
+
+    # -------------------------------------------------------------------------
+    # Construction, catalog resources, and memory schema
+    # -------------------------------------------------------------------------
 
     def __init__(self, catalog_path: str | Path = "data/catalog.jsonl") -> None:
         self.catalog_path = Path(catalog_path)
@@ -672,6 +700,10 @@ class Agent:
         )
 
         self.memory_connection.commit()
+
+    # -------------------------------------------------------------------------
+    # Clarification policy and structured state reduction
+    # -------------------------------------------------------------------------
 
     def _next_question(
     self,
@@ -916,6 +948,10 @@ class Agent:
 
         return False
 
+    # -------------------------------------------------------------------------
+    # Confidence gates, signature matching, and deterministic reranking
+    # -------------------------------------------------------------------------
+
     def _should_withhold_recommendations(
         self,
         state: SessionState,
@@ -1155,6 +1191,10 @@ class Agent:
             or top_raw_rank >= TURN_TWO_GATE_MIN_RAW_RANK
         )
 
+    # -------------------------------------------------------------------------
+    # Catalog indexing
+    # -------------------------------------------------------------------------
+
     def _build_index(self) -> None:
         cursor = self.connection.cursor()
         cursor.execute(
@@ -1262,6 +1302,10 @@ class Agent:
             cursor.executemany("INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
         self.connection.commit()
 
+    # -------------------------------------------------------------------------
+    # Session identity and persistent interaction memory
+    # -------------------------------------------------------------------------
+
     def _profile_key(self, user_profile: dict) -> str:
         serialized = json.dumps(
             user_profile,
@@ -1335,7 +1379,8 @@ class Agent:
         return f"session:{session_id}"
 
     def reset(self, session_id: str, user_profile: dict) -> None:
-        # The profile is anonymized and may be used for personalization.
+        # Start a clean short-term state while deriving a privacy-safe key for
+        # any long-term preferences associated with this user or session.
             profile_key = self._memory_key(session_id, user_profile,)
 
             self._sessions[session_id] = SessionState(
@@ -1347,6 +1392,9 @@ class Agent:
         self,
         state: SessionState,
     ) -> set[str]:
+
+        # Exact matches supplement FTS retrieval so rare, high-value product
+        # requirements cannot disappear outside the lexical candidate window.
 
         candidate_sets = []
 
@@ -1451,6 +1499,10 @@ class Agent:
 
         return score
 
+    # -------------------------------------------------------------------------
+    # Conservative long-term preference learning
+    # -------------------------------------------------------------------------
+
     def _is_learnable_preference(self, value: str) -> bool:
         terms = _terms(value)
 
@@ -1468,6 +1520,8 @@ class Agent:
     state: SessionState,
     turn: int, ) -> None:
 
+        # Only evidence introduced on this turn is learned. Repetition raises
+        # confidence gradually; competing values decay instead of disappearing.
         preferences = set()
 
         for record in state.constraint_records:
@@ -1682,6 +1736,10 @@ class Agent:
             recommendations,
         )
 
+    # -------------------------------------------------------------------------
+    # Robust input handling and controlled self-evolution
+    # -------------------------------------------------------------------------
+
     def _reset_exposure_on_override(
         self,
         state: SessionState,
@@ -1734,7 +1792,9 @@ class Agent:
         turn: int,
         recommendations: list[dict],
     ) -> bool:
-        """Explore only after explicit rejection of a completely stale slate."""
+        # Exploration is intentionally narrow: it requires explicit negative
+        # feedback and a slate containing no unseen item. This prevents normal
+        # successful rankings from drifting as memory accumulates.
         if not self.self_evolution_enabled or turn <= 1 or not recommendations:
             return False
 
@@ -1765,6 +1825,8 @@ class Agent:
         top_k: int,
     ) -> list[dict]:
         """Place one unseen candidate first without otherwise changing the slate."""
+        # Promote exactly one unseen item, preserving the relative order of the
+        # remaining recommendations and making the behavior easy to roll back.
         probe = next(
             (
                 item
@@ -1784,6 +1846,10 @@ class Agent:
                 if item["parent_asin"] != probe["parent_asin"]
             ]
         )[:top_k]
+
+    # -------------------------------------------------------------------------
+    # Candidate retrieval and scoring
+    # -------------------------------------------------------------------------
 
     def _retrieve_candidates(
         self,
@@ -1991,6 +2057,10 @@ class Agent:
 
         return recommendations
 
+    # -------------------------------------------------------------------------
+    # Evaluator-facing API
+    # -------------------------------------------------------------------------
+
     def respond(
         self,
         session_id: str,
@@ -1998,14 +2068,18 @@ class Agent:
         turn: int,
         top_k: int,
     ) -> dict:
+        """Process one user turn and return the evaluator response contract."""
         if session_id not in self._sessions:
             raise RuntimeError("reset must be called before respond")
 
+        # 1. Normalize safe structural typos, clear stale exposure state when
+        # intent changes, and reduce the new message into structured context.
         state = self._sessions[session_id]
         processing_message = self._prepare_user_message(user_message)
         self._reset_exposure_on_category_change(state, processing_message)
         self._reset_exposure_on_override(state, processing_message)
         self._reduce_state(state, processing_message, turn)
+        # 2. Retrieve a wider pool only for the guarded final-turn rescue.
         response_top_k = top_k
         ranking_top_k = (
             FINAL_RESCUE_WINDOW
@@ -2017,6 +2091,8 @@ class Agent:
             ranking_top_k,
         )
 
+        # 3. Withhold under-specified early slates to avoid locking in a weak
+        # reciprocal rank before the user provides a second constraint.
         ask_attribute = "other"
         confidence_gated = self._should_withhold_recommendations(
             state,
@@ -2036,6 +2112,8 @@ class Agent:
                 f"{QUESTION_MESSAGES[ask_attribute]}"
             )
 
+        # 4. Promote small exact-signature pools, then apply the popularity
+        # prior only when the query remains broad enough for it to be safe.
         recommendations, signature_pool_size = self._promote_signature_pool(
             state,
             recommendations,
@@ -2061,6 +2139,7 @@ class Agent:
                 f"{QUESTION_MESSAGES[ask_attribute]}"
             )
 
+        # 5. Enforce the requested slate size or run the guarded final rescue.
         if turn == FINAL_RESCUE_TURN:
             recommendations = self._apply_final_turn_rescue(
                 state,
@@ -2070,6 +2149,8 @@ class Agent:
         else:
             recommendations = recommendations[:response_top_k]
 
+        # 6. Explicit negative feedback may trigger one controlled exploration
+        # candidate; otherwise the ranked slate is left unchanged.
         if self._should_probe_unseen_candidate(
             state,
             processing_message,
@@ -2101,6 +2182,8 @@ class Agent:
             for item in recommendations
         )
 
+        # 7. Memory updates are best-effort. Persistence failures are reported
+        # to stderr but never prevent a valid recommendation response.
         try:
             self._log_interaction(
                 session_id=session_id,
