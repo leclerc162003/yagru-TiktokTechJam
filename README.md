@@ -2,7 +2,7 @@
 
 ![alt text](image.png)
 
-Shop Shop is a fully offline coversational agent that is built for E-Commerce Shopping. It understands user's messages, learns the intent behind those messages, and continues to clarify and ask for more information to identify the user's ideal product. 
+Shop Shop is a fully offline conversational agent that is built for E-Commerce Shopping. It understands user's messages, learns the intent behind those messages, and continues to clarify and ask for more information to identify the user's ideal product. 
 
 Shop Shop only uses the Python Standard Library and SQLite FTS5. It does not require any LLM, API or Network. This means it is fully offline, which allows it to run quickly and efficiently.
 
