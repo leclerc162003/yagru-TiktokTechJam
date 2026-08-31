@@ -33,17 +33,20 @@ python3 -m evaluator.local_evaluator
 
 
 1. **Limited Coverage** 
+    
     Shop Shop is optimised for this specific category and dataset used in this project. Hence, the results may not transfer outside of this category/dataset. 
 
     If time was not a limitation, we would expand it to be more adaptable across other categories and make it more robust in terms of cross-category intent and attribute understanding. 
   
 
 2. **Intent Understanding Limitations** 
+    
     Without the use of LLMs, unusual phrasings, typos and intent may be misunderstood easily. We have tried to ensure our Shop Shop is robust enough to tackle these issues, but there are still limitations to these measures. 
 
     If time and cost was not a limitation, a well implemented LLM could have been used to understand and learn the intent of the user's message more to have a more accurate search. 
 
 3. **Lack of New User Information** 
+    
     If the user is a new user, the Shop Shop has no history or profile to reference with, hence it may produce an inaccurate result. 
 
     If time was not a limitation, and if it is within the scope, if there is avaliable data relating to the new user (from onboarding preferences questions (questions new users are asked when they first opened the app), data from the new user behaviour, data from cross platforms), this would allow shop shop to have a better understanding of the user and give a more accurate result.
