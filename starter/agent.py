@@ -133,6 +133,9 @@ FINAL_RESCUE_TURN = 10
 FINAL_RESCUE_WINDOW = 50
 FINAL_RESCUE_RAW_SCORE_GAP = 4.0
 FINAL_RESCUE_RATING_RATIO = 5.0
+# Kill switch for the runtime self-evolution controller.
+SELF_EVOLUTION_ENABLED = True
+SELF_EVOLUTION_CANDIDATE_WINDOW = 100
 
 
 @dataclass
@@ -171,6 +174,7 @@ class SessionState:
 
     mode: str = ""
     override_seen: bool = False
+    shown_parent_asins: set[str] = field(default_factory=set)
 
     @property
     def constraints(self) -> list[str]:
@@ -519,6 +523,7 @@ class Agent:
         self._signature_category_index: dict[str, set[str]] = defaultdict(set)
         self._rating_count: dict[str, float] = {}
         self._attribute_parse_cache: dict[str, dict[str, str]] = {}
+        self.self_evolution_enabled = SELF_EVOLUTION_ENABLED
         self.sessions = {}
         catalog_data_dir = self.catalog_path.resolve().parent
         self.memory_connection = sqlite3.connect(
@@ -1553,32 +1558,85 @@ class Agent:
             turn,
             recommendations,
         )
-    
-    
 
-    def respond(
+    def _reset_exposure_on_override(
         self,
-        session_id: str,
+        state: SessionState,
+        user_message: str,
+    ) -> None:
+        if _is_override(user_message):
+            state.shown_parent_asins.clear()
+
+    def _should_probe_unseen_candidate(
+        self,
+        state: SessionState,
         user_message: str,
         turn: int,
-        top_k: int,
-    ) -> dict:
-        if session_id not in self._sessions:
-            raise RuntimeError("reset must be called before respond")
+        recommendations: list[dict],
+    ) -> bool:
+        """Explore only after explicit rejection of a completely stale slate."""
+        if not self.self_evolution_enabled or turn <= 1 or not recommendations:
+            return False
 
-        state = self._sessions[session_id]
-        self._reduce_state(state, user_message, turn)
-        response_top_k = top_k
-        ranking_top_k = (
-            FINAL_RESCUE_WINDOW
-            if turn == FINAL_RESCUE_TURN
-            else top_k
+        lowered = user_message.lower()
+        explicit_negative = any(
+            marker in lowered
+            for marker in (
+                "not quite right",
+                "don't have an additional preference",
+                "do not have an additional preference",
+                "don't have a preference",
+                "do not have a preference",
+            )
+        )
+        if not explicit_negative:
+            return False
+
+        return all(
+            item["parent_asin"] in state.shown_parent_asins
+            for item in recommendations
         )
 
+    def _probe_unseen_candidate(
+        self,
+        state: SessionState,
+        recommendations: list[dict],
+        exploration_candidates: list[dict],
+        top_k: int,
+    ) -> list[dict]:
+        """Place one unseen candidate first without otherwise changing the slate."""
+        probe = next(
+            (
+                item
+                for item in exploration_candidates
+                if item["parent_asin"] not in state.shown_parent_asins
+            ),
+            None,
+        )
+        if probe is None:
+            return recommendations[:top_k]
+
+        return (
+            [probe]
+            + [
+                item
+                for item in recommendations
+                if item["parent_asin"] != probe["parent_asin"]
+            ]
+        )[:top_k]
+
+    def _retrieve_candidates(
+        self,
+        state: SessionState,
+        ranking_top_k: int,
+    ) -> list[dict]:
         profile = state.user_profile
         preferences = profile.get("preference_tags", [])
 
-        learned_preferences = self._load_learned_preferences(state.profile_key,limit=5,)
+        learned_preferences = self._load_learned_preferences(
+            state.profile_key,
+            limit=5,
+        )
 
         query = state.search_text()
         retrieval_query = state.retrieval_text()
@@ -1602,7 +1660,7 @@ class Agent:
             all_terms.extend(preference_terms)
             if state.mode == "browsing" and len(all_terms) < 8:
                 for preference in learned_preferences:
-                    all_terms.extend(_terms(preference))
+                    all_terms.extend(_terms(preference["value"]))
 
         unique_terms = list(dict.fromkeys(all_terms))[:40]
         expression = " OR ".join(f'"{term}"' for term in unique_terms)
@@ -1771,6 +1829,32 @@ class Agent:
                 for item in scored_rows[:ranking_top_k]
             ]
 
+        return recommendations
+
+    def respond(
+        self,
+        session_id: str,
+        user_message: str,
+        turn: int,
+        top_k: int,
+    ) -> dict:
+        if session_id not in self._sessions:
+            raise RuntimeError("reset must be called before respond")
+
+        state = self._sessions[session_id]
+        self._reset_exposure_on_override(state, user_message)
+        self._reduce_state(state, user_message, turn)
+        response_top_k = top_k
+        ranking_top_k = (
+            FINAL_RESCUE_WINDOW
+            if turn == FINAL_RESCUE_TURN
+            else top_k
+        )
+        recommendations = self._retrieve_candidates(
+            state,
+            ranking_top_k,
+        )
+
         ask_attribute = "other"
         confidence_gated = self._should_withhold_recommendations(
             state,
@@ -1823,6 +1907,37 @@ class Agent:
             )
         else:
             recommendations = recommendations[:response_top_k]
+
+        if self._should_probe_unseen_candidate(
+            state,
+            user_message,
+            turn,
+            recommendations,
+        ):
+            exploration_candidates = self._retrieve_candidates(
+                state,
+                SELF_EVOLUTION_CANDIDATE_WINDOW,
+            )
+            exploration_candidates, _ = self._promote_signature_pool(
+                state,
+                exploration_candidates,
+                SELF_EVOLUTION_CANDIDATE_WINDOW,
+            )
+            exploration_candidates = self._rerank_with_popularity_prior(
+                state,
+                exploration_candidates,
+            )
+            recommendations = self._probe_unseen_candidate(
+                state,
+                recommendations,
+                exploration_candidates,
+                response_top_k,
+            )
+
+        state.shown_parent_asins.update(
+            item["parent_asin"]
+            for item in recommendations
+        )
 
         try:
             self._log_interaction(
