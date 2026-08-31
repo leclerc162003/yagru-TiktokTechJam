@@ -18,7 +18,7 @@ Shop Shop only uses the Python Standard Library and SQLite FTS5. It does not req
 ### 1. Clone and enter the repository
 
 ```bash
-git clone <repository-url>
+git clone <https://github.com/leclerc162003/yagru-TiktokTechJam.git>
 cd yagru-TiktokTechJam
 ```
 
