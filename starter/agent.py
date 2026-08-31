@@ -136,6 +136,44 @@ FINAL_RESCUE_RATING_RATIO = 5.0
 # Kill switch for the runtime self-evolution controller.
 SELF_EVOLUTION_ENABLED = True
 SELF_EVOLUTION_CANDIDATE_WINDOW = 100
+# Kill switch for conservative input/state robustness hardening.
+ROBUSTNESS_HARDENING_ENABLED = True
+STRUCTURAL_CUE_WORDS = frozenset({
+    "actually",
+    "additional",
+    "changed",
+    "earlier",
+    "exploring",
+    "forget",
+    "ignore",
+    "instead",
+    "judgment",
+    "looking",
+    "longer",
+    "matters",
+    "options",
+    "preference",
+    "quite",
+    "requirement",
+    "right",
+    "still",
+})
+
+
+def _build_structural_deletion_index() -> dict[str, tuple[str, ...]]:
+    candidates: dict[str, set[str]] = defaultdict(set)
+
+    for word in STRUCTURAL_CUE_WORDS:
+        for index in range(1, len(word) - 1):
+            candidates[word[:index] + word[index + 1:]].add(word)
+
+    return {
+        value: tuple(sorted(words))
+        for value, words in candidates.items()
+    }
+
+
+STRUCTURAL_DELETION_INDEX = _build_structural_deletion_index()
 
 
 @dataclass
@@ -171,6 +209,7 @@ class SessionState:
 
     asked_attributes: set[str] = field(default_factory=set)
     unavailable_attributes: set[str] = field(default_factory=set)
+    conflicted_attributes: set[str] = field(default_factory=set)
 
     mode: str = ""
     override_seen: bool = False
@@ -321,7 +360,11 @@ def _normalize(text: str) -> str:
     return " ".join(TOKEN_RE.findall(text.lower()))
 
 
-def _extract_constraints(message: str) -> list[str]:
+def _extract_constraints(
+    message: str,
+    *,
+    sentence_bounded: bool = False,
+) -> list[str]:
     patterns = [
         "a key requirement is:",
         "for that, what matters is:",
@@ -336,6 +379,9 @@ def _extract_constraints(message: str) -> list[str]:
         if position != -1:
             value = message[position + len(pattern):]
 
+            if sentence_bounded:
+                value = re.split(r"(?<=[.!?])\s+", value, maxsplit=1)[0]
+
             return [
                 item.strip(" .")
                 for item in value.split(";")
@@ -343,6 +389,37 @@ def _extract_constraints(message: str) -> list[str]:
             ]
 
     return []
+
+
+def _repair_structural_typos(message: str) -> str:
+    """Repair one-edit damage only for words that control state parsing."""
+
+    def repair(match: re.Match[str]) -> str:
+        original = match.group(0)
+        word = original.lower()
+
+        if len(word) < 5 or word in STRUCTURAL_CUE_WORDS:
+            return original
+
+        candidates = set(STRUCTURAL_DELETION_INDEX.get(word, ()))
+
+        for index in range(1, len(word) - 1):
+            swapped = (
+                word[:index]
+                + word[index + 1]
+                + word[index]
+                + word[index + 2:]
+            )
+            if swapped in STRUCTURAL_CUE_WORDS:
+                candidates.add(swapped)
+
+        if len(candidates) != 1:
+            return original
+
+        replacement = next(iter(candidates))
+        return replacement.capitalize() if original[0].isupper() else replacement
+
+    return re.sub(r"[A-Za-z]+", repair, message)
 
 
 def _is_override(message: str) -> bool:
@@ -524,6 +601,7 @@ class Agent:
         self._rating_count: dict[str, float] = {}
         self._attribute_parse_cache: dict[str, dict[str, str]] = {}
         self.self_evolution_enabled = SELF_EVOLUTION_ENABLED
+        self.robustness_hardening_enabled = ROBUSTNESS_HARDENING_ENABLED
         self.sessions = {}
         catalog_data_dir = self.catalog_path.resolve().parent
         self.memory_connection = sqlite3.connect(
@@ -757,7 +835,17 @@ class Agent:
         if retry_message:
             return True
 
-        new_constraints = _extract_constraints(user_message)
+        robustness_enabled = bool(
+            getattr(
+                self,
+                "robustness_hardening_enabled",
+                ROBUSTNESS_HARDENING_ENABLED,
+            )
+        )
+        new_constraints = _extract_constraints(
+            user_message,
+            sentence_bounded=robustness_enabled,
+        )
         no_preference = "don't have" in lowered or "do not have" in lowered
         new_attributes = {} if no_preference else self._extract_attributes(user_message)
 
@@ -765,8 +853,12 @@ class Agent:
             state.override_seen = True
             state.supersede_free_text_preferences(turn)
 
+        first_new_record = len(state.constraint_records)
+        parsed_constraint_attributes: set[str] = set()
+
         for constraint in new_constraints:
             attribute = self._constraint_attribute(constraint)
+            parsed_constraint_attributes.add(attribute)
             state.add_constraint(
                 constraint,
                 attribute,
@@ -777,7 +869,40 @@ class Agent:
                 ),
             )
 
+        turn_conflicts: set[str] = set()
+
+        if robustness_enabled:
+            keyed_constraints: dict[str, list[ConstraintRecord]] = defaultdict(list)
+
+            for record in state.constraint_records[first_new_record:]:
+                explicitly_keyed = record.value.lower().startswith(
+                    f"{record.attribute}:"
+                )
+                if (
+                    record.active
+                    and record.attribute in SINGLE_VALUE_ATTRIBUTES
+                    and explicitly_keyed
+                ):
+                    keyed_constraints[record.attribute].append(record)
+
+            for attribute, records in keyed_constraints.items():
+                if len({record.normalized for record in records}) <= 1:
+                    state.conflicted_attributes.discard(attribute)
+                    continue
+
+                for record in records:
+                    record.active = False
+
+                state.attributes.pop(attribute, None)
+                state.conflicted_attributes.add(attribute)
+                turn_conflicts.add(attribute)
+
+            for attribute in parsed_constraint_attributes - turn_conflicts:
+                state.conflicted_attributes.discard(attribute)
+
         for attribute, value in new_attributes.items():
+            if attribute in turn_conflicts:
+                continue
             # Replacing one slot must not erase unrelated attributes.
             state.attributes[attribute] = value
 
@@ -1567,6 +1692,43 @@ class Agent:
         if _is_override(user_message):
             state.shown_parent_asins.clear()
 
+    def _prepare_user_message(self, user_message: str) -> str:
+        if not bool(
+            getattr(
+                self,
+                "robustness_hardening_enabled",
+                ROBUSTNESS_HARDENING_ENABLED,
+            )
+        ):
+            return user_message
+
+        return _repair_structural_typos(user_message)
+
+    def _reset_exposure_on_category_change(
+        self,
+        state: SessionState,
+        user_message: str,
+    ) -> None:
+        if not bool(
+            getattr(
+                self,
+                "robustness_hardening_enabled",
+                ROBUSTNESS_HARDENING_ENABLED,
+            )
+        ) or not state.category_text:
+            return
+
+        match = re.search(
+            r"looking for (.*?)(?:\.|, but|$)",
+            user_message,
+            re.I,
+        )
+        if (
+            match
+            and _normalize(match.group(1)) != _normalize(state.category_text)
+        ):
+            state.shown_parent_asins.clear()
+
     def _should_probe_unseen_candidate(
         self,
         state: SessionState,
@@ -1842,8 +2004,10 @@ class Agent:
             raise RuntimeError("reset must be called before respond")
 
         state = self._sessions[session_id]
-        self._reset_exposure_on_override(state, user_message)
-        self._reduce_state(state, user_message, turn)
+        processing_message = self._prepare_user_message(user_message)
+        self._reset_exposure_on_category_change(state, processing_message)
+        self._reset_exposure_on_override(state, processing_message)
+        self._reduce_state(state, processing_message, turn)
         response_top_k = top_k
         ranking_top_k = (
             FINAL_RESCUE_WINDOW
@@ -1910,7 +2074,7 @@ class Agent:
 
         if self._should_probe_unseen_candidate(
             state,
-            user_message,
+            processing_message,
             turn,
             recommendations,
         ):
