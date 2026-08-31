@@ -133,9 +133,11 @@ FINAL_RESCUE_TURN = 10
 FINAL_RESCUE_WINDOW = 50
 FINAL_RESCUE_RAW_SCORE_GAP = 4.0
 FINAL_RESCUE_RATING_RATIO = 5.0
+
 # Kill switch for the runtime self-evolution controller.
 SELF_EVOLUTION_ENABLED = True
 SELF_EVOLUTION_CANDIDATE_WINDOW = 100
+
 # Kill switch for conservative input/state robustness hardening.
 ROBUSTNESS_HARDENING_ENABLED = True
 STRUCTURAL_CUE_WORDS = frozenset({
@@ -240,9 +242,6 @@ class SessionState:
 
         if not normalized:
             return
-
-        # A repeated value in an override is a reaffirmation, not a request to
-        # discard other evidence associated with the same broad attribute.
         if any(
             record.active and record.normalized == normalized
             for record in self.constraint_records
@@ -1337,7 +1336,6 @@ class Agent:
 
     def reset(self, session_id: str, user_profile: dict) -> None:
         # The profile is anonymized and may be used for personalization.
-    #    self._sessions[session_id] = SessionState(user_profile=user_profile)
             profile_key = self._memory_key(session_id, user_profile,)
 
             self._sessions[session_id] = SessionState(
